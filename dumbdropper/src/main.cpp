@@ -1,7 +1,5 @@
 /****************
-* Helloworld.c
-* The most simplistic C program ever written.
-* An epileptic monkey on crack could write this code.
+* Dumb packet dropper
 *****************/
 #include <iostream>
 #include <string>
