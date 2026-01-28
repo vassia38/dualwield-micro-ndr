@@ -19,7 +19,7 @@
 include $(TOPDIR)/rules.mk
 
 # Name and release number of this package
-PKG_NAME:=helloworldplus
+PKG_NAME:=dumbdropper
 PKG_RELEASE:=1
 
 
@@ -41,7 +41,7 @@ define Package/$(PKG_NAME)
 	SECTION:=utils
 	CATEGORY:=Utilities
 	TITLE:=Helloworldplus -- prints a snarky message
-	DEPENDS:=+libstdcpp +libc
+	DEPENDS=+libstdcpp +libc
 #	DESCRIPTION:=\
 #	If you can't figure out what this program does, \\\
 #	you're probably brain-dead and need immediate \\\
