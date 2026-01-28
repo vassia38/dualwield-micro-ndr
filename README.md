@@ -14,18 +14,18 @@ bpftool xdp-filter xdp-loader xdpdump libxdp libbpf
 
 ### Check OpenWRT can run XDP
 
-Check Kernel Version:
+Check Kernel Version: <br/>
 `uname -r`
 > should be > 4.8
 
-Check JIT Status: XDP performance relies heavily on the Just-In-Time compiler.
+Check JIT Status: XDP performance relies heavily on the Just-In-Time compiler.<br/>
 `sysctl net.core.bpf_jit_enable`
 > Value should be 1 or 2. If it's 0, try `sysctl -w net.core.bpf_jit_enable=1`.
 
-Verify BPF Filesystem:
+Verify BPF Filesystem: <br/>
 `mount | grep bpf`
-> If empty, run: mount -t bpf bpffs /sys/fs/bpf.
+> If empty, run: `mount -t bpf bpffs /sys/fs/bpf`.
 
-Feature probing:
-bpftool feature probe | grep xdp
-> Should see something like "eBPF program_type xdp is available"
+Feature probing: <br/>
+`bpftool feature probe | grep xdp`
+> Should see something like `eBPF program_type xdp is available`
