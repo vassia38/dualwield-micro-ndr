@@ -1,0 +1,10 @@
+# configure the firmware image
+make menuconfig
+
+# build the firmware image and packages
+make defconfig download clean world
+
+# how to crosscompile C++
+# starts here https://github.com/airplug/airplug/wiki/Cross-compiling-for-OpenWRT
+# fixes are here https://forum.archive.openwrt.org/viewtopic.php?id=42098
+# tldr don't forget to use DEPENDS in a package's Makefile
