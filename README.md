@@ -29,3 +29,11 @@ Verify BPF Filesystem: <br/>
 Feature probing: <br/>
 `bpftool feature probe | grep xdp`
 > Should see something like `eBPF program_type xdp is available`
+
+Identify interfaces and drivers. List device names for WAN and LAN with `ip link`. Then read `ethtool -i` to see the driver. That predicts whether native mode will attach or fall back to generic mode.
+
+
+## Sources:
+[https://phb-crystal-ball.org/set-up-xdp-firewall-in-openwrt/#When_it_makes_sense_on_home_lab_and_edge_routers](https://phb-crystal-ball.org/set-up-xdp-firewall-in-openwrt/#When_it_makes_sense_on_home_lab_and_edge_routers)
+[https://www.tigera.io/learn/guides/ebpf/ebpf-xdp/](https://www.tigera.io/learn/guides/ebpf/ebpf-xdp/)
+[https://www.gargoyle-router.com/old-openwrt-coding.html](https://www.gargoyle-router.com/old-openwrt-coding.html)
