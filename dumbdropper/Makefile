@@ -21,7 +21,7 @@ include $(TOPDIR)/rules.mk
 # Name and release number of this package
 PKG_NAME:=dumbdropper
 PKG_RELEASE:=1
-
+OUTPUT_OBJ=dumbdropper.o
 
 # This specifies the directory where we're going to build the program.  
 # The root build directory, $(BUILD_DIR), is by default the build_mipsel 
@@ -41,7 +41,7 @@ define Package/$(PKG_NAME)
 	SECTION:=utils
 	CATEGORY:=Utilities
 	TITLE:=Helloworldplus -- prints a snarky message
-	DEPENDS=+libstdcpp +libc
+	DEPENDS=+libstdcpp +libc +libbpf
 #	DESCRIPTION:=\
 #	If you can't figure out what this program does, \\\
 #	you're probably brain-dead and need immediate \\\
@@ -103,7 +103,7 @@ endef
 # directory) to the install directory.
 define Package/$(PKG_NAME)/install
 	$(INSTALL_DIR) $(1)/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/$(PKG_NAME) $(1)/bin/
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/$(OUTPUT_OBJ) $(1)/bin/
 endef
 
 
