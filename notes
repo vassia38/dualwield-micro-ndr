@@ -9,3 +9,7 @@ make defconfig download clean world
 # fixes are here https://forum.archive.openwrt.org/viewtopic.php?id=42098
 # TL:DR 	don't forget to use DEPENDS in a package's Makefile
 # 		have your src/ CLEAN
+#
+# Cum incarc un fisier de reguli ??
+#
+# Stabilesc un set despre CE FILTREZ (cum ma bate capul , sa acopere chestiunile curente)
