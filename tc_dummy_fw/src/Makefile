@@ -11,9 +11,9 @@ BPF_CFLAGS := -target bpf -O2 -g -c -D__BPF_TRACING__
 
 # 3. The compilation rule
 # We add $(CPPFLAGS) to pick up include paths (like libbpf) if OpenWrt sets them.
-all: dumbdropper.o
-dumbdropper.o: main.c
-	$(BPF_CC) $(BPF_CFLAGS) $(CPPFLAGS) main.c -o dumbdropper.o
+all: tc_dummy_fw.o
+tc_dummy_fw.o: main.c
+	$(BPF_CC) $(BPF_CFLAGS) $(CPPFLAGS) main.c -o tc_dummy_fw.o
 
 # 4. Clean target
 clean:
