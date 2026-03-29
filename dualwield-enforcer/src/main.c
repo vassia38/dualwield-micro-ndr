@@ -6,6 +6,21 @@
 #define TC_ACT_SHOT 2
 #define TC_ACT_UNSPEC -1
 #define ETH_P_IP 0x0800
+
+// =================================
+// Data Structures
+// =================================
+
+/*
+struct bpf_map_def {
+  unsigned int type;
+  unsigned int key_size;
+  unsigned int value_size;
+  unsigned int max_entries;
+  unsigned int map_flags;
+};
+*/
+
 // define 5-tuple flow-key
 struct flow_key {
   __u32 src_ip;
@@ -20,6 +35,40 @@ struct flow_key {
 //  __u64 packets;
 //  __u64 bytes;
 //};
+
+// =================================
+// eBPF MAP DEFINITIONS (LEGACY SYNTAX)
+// =================================
+// we use SEC("maps") instead of SEC(".maps") to avoid the "failed to find
+// valid kernel BTF" error on constrained OpenWRT builds
+
+/*
+// map to keep track of active flow
+struct bpf_map_def SEC("maps") active_flows = {
+    .type = BPF_MAP_TYPE_HASH,
+    .max_entries = 4096, // reasonable for 128/256MB RAM
+    .key_size = sizeof(struct flow_key),
+    .value_size = sizeof(struct flow_stats),
+};
+
+// Perf Event Array to send data to userspace
+struct bpf_map_def SEC("maps") flow_export_events = {
+    .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(__u32),
+    .max_entries = 0, // dynamically sized by the loader per-CPU
+};
+
+// Define the dummy firewall map
+// Key: IPv4 address (32-bit integer)
+// Value: A dummy flag/counter (32-bit integer)
+struct bpf_map_def SEC("maps") drop_ips_map = {
+    .type = BPF_MAP_TYPE_HASH,
+    .max_entries = 1024,
+    .key_size = sizeof(struct flow_key),
+    .value_size = sizeof(struct flow_stats),
+};
+*/
 
 // map to keep track of active flow
 struct {
@@ -46,13 +95,18 @@ struct {
   __type(value, __u32);
 } drop_ips_map SEC(".maps");
 
+// =================================
+// PACKET PROCCESSING LOGIC
+// =================================
+
 SEC("tc")
 int dummy_firewall(struct __sk_buff *skb) {
   // skb->data and skb->data_end are pointers to the raw packet data
   void *data = (void *)(long)skb->data;
   void *data_end = (void *)(long)skb->data_end;
 
-  // 1. Parse Ethernet Header
+  // --- 1. Parse Ethernet ---
+
   struct ethhdr *eth = data;
 
   // Bounds checking is strictly required by the eBPF verifier
@@ -63,7 +117,8 @@ int dummy_firewall(struct __sk_buff *skb) {
   if (eth->h_proto != bpf_htons(ETH_P_IP))
     return TC_ACT_OK;
 
-  // 2. Parse IPv4 Header
+  // --- 2. Parse IPv4 ---
+
   struct iphdr *ip = (void *)(eth + 1);
 
   // Bounds checking for the IP header
@@ -72,7 +127,8 @@ int dummy_firewall(struct __sk_buff *skb) {
 
   __u32 src_ip = ip->saddr;
 
-  // 3. Map Lookup
+  // --- 3. Blocklist Lookup ---
+
   __u32 *value = bpf_map_lookup_elem(&drop_ips_map, &src_ip);
   if (value) {
     // Source IP is in our dummy map! Drop the packet.
@@ -80,7 +136,7 @@ int dummy_firewall(struct __sk_buff *skb) {
     return TC_ACT_SHOT;
   }
 
-  // 4. If the packet was not blocked, we track it
+  // --- 4. Flow tracking ---
 
   struct flow_key fkey = {};
   fkey.src_ip = ip->saddr;
@@ -103,7 +159,7 @@ int dummy_firewall(struct __sk_buff *skb) {
   if (ip->protocol == IPPROTO_TCP) {
     struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
 
-    // strictly check the TCP header is within pacxket Bounds
+    // strictly check the TCP header is within packet bounds
     if ((void *)(tcp + 1) > data_end) {
       return TC_ACT_OK;
     }
@@ -111,7 +167,9 @@ int dummy_firewall(struct __sk_buff *skb) {
     // ports in network byte order
     fkey.src_port = tcp->source;
     fkey.dest_port = tcp->dest;
-  } else if (ip->protocol == IPPROTO_UDP) {
+  }
+  // parse UDP ports
+  else if (ip->protocol == IPPROTO_UDP) {
     struct udphdr *udp = (void *)((__u8 *)ip + ip_hdr_len);
 
     // strictly check bounds for udphdr
@@ -123,12 +181,14 @@ int dummy_firewall(struct __sk_buff *skb) {
     fkey.dest_port = udp->dest;
   }
 
-  // Lookup existing flow
+  // Update the flow statistics
   struct flow_stats *stats = bpf_map_lookup_elem(&active_flows, &fkey);
   if (stats) {
+    // Flow exists: atomically increment counters
     __sync_fetch_and_add(&stats->pkts, 1);
     __sync_fetch_and_add(&stats->bytes, skb->len);
   } else {
+    // New flow: init and insert
     struct flow_stats new_stats = {1, skb->len};
     bpf_map_update_elem(&active_flows, &fkey, &new_stats, BPF_ANY);
     // Optionally, notify userspace of a new connection via the Perf Buffer

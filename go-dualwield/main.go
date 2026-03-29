@@ -2,6 +2,7 @@ package main
 
 import (
 	//"bytes"
+	"bufio"
 	"encoding/binary"
 	//"errors"
 	"fmt"
@@ -9,9 +10,10 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
-	//"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -46,6 +48,85 @@ func ntohs(port uint16) uint16 {
 	return (port << 8) | (port >> 8)
 }
 
+// ipToUint32 converts a string IP to the uint32 format expected by the eBPF map.
+func ipToUint32(ipStr string) (uint32, error) {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return 0, fmt.Errorf("invalid IP format")
+	}
+	
+	ip = ip.To4()
+	if ip == nil {
+		return 0, fmt.Errorf("not an IPv4 address")
+	}
+
+	// MT7621 is Little-Endian. The C code reads the 4-byte network IP directly 
+	// into a uint32, so we must pack the bytes exactly as they appear in memory.
+	return binary.LittleEndian.Uint32(ip), nil
+}
+
+// monitorBanlist reads a text file and syncs it with the eBPF drop map.
+func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Cache to track what is currently in the eBPF map, saving unnecessary system calls
+	knownBans := make(map[uint32]bool)
+
+	for range ticker.C {
+		file, err := os.Open(filepath)
+		if err != nil {
+			if !os.IsNotExist(err) { // Ignore error if file just hasn't been created yet
+				log.Printf("Error opening banlist: %v", err)
+			}
+			continue
+		}
+
+		scanner := bufio.NewScanner(file)
+		currentFileIPs := make(map[uint32]bool)
+
+		// 1. Read the file and ADD new bans
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue // Skip empty lines and comments
+			}
+
+			ipInt, err := ipToUint32(line)
+			if err != nil {
+				log.Printf("Skipping invalid IP in banlist '%s': %v", line, err)
+				continue
+			}
+
+			currentFileIPs[ipInt] = true
+
+			// If it's a new IP, push it to the kernel
+			if !knownBans[ipInt] {
+				dummyValue := uint32(1)
+				if err := dropMap.Put(&ipInt, &dummyValue); err != nil {
+					log.Printf("Failed to block IP %s: %v", line, err)
+				} else {
+					log.Printf("[BANNED] Added %s to firewall drop map", line)
+					knownBans[ipInt] = true
+				}
+			}
+		}
+		file.Close()
+
+		// 2. REMOVE bans that are no longer in the text file
+		for bannedIpInt := range knownBans {
+			if !currentFileIPs[bannedIpInt] {
+				if err := dropMap.Delete(&bannedIpInt); err != nil {
+					log.Printf("Failed to unblock IP: %v", err)
+				} else {
+					log.Printf("[UNBANNED] Removed %s from firewall drop map", intToIP(bannedIpInt).String())
+					delete(knownBans, bannedIpInt)
+				}
+			}
+		}
+	}
+}
+
 func main() {
 	// 1. Load the compiled eBPF objects into the kernel
 	objs := bpfObjects{}
@@ -55,11 +136,29 @@ func main() {
 	defer objs.Close()
 
 	// 2. Setup Network Interface and Attach TC hook
-	ifaceName := "br-lan"
+	fmt.Print("Enter the interface name to attach the firewall (e.g., br-lan, eth0, eth1): ")
+	// Create a reader to read from standard input (the keyboard)
+	reader := bufio.NewReader(os.Stdin)
+	inputName, err := reader.ReadString('\n')	
+	if err != nil {
+		log.Fatalf("Failed to read input: %v", err)
+	}
+
+	// Clean up the input (removes the hidden newline character from pressing Enter)
+	ifaceName := strings.TrimSpace(inputName)
+
+	if ifaceName == "" {
+		log.Fatalf("Error: Interface name cannot be empty. Exiting.")
+	}
+
+	log.Printf("Attempting to attach to interface: %s", ifaceName)
+
+	// 3. Setup Network Interface and Attach TC hook
 	link, err := netlink.LinkByName(ifaceName)
 	if err != nil {
-		log.Fatalf("Failed to find interface %s: %v", ifaceName, err)
+		log.Fatalf("Failed to find interface '%s': %v\n(Check 'ip link' to see available interfaces)", ifaceName, err)
 	}
+
 
 	// Create the clsact qdisc (equivalent to: tc qdisc add dev br-lan clsact)
 	qdisc := &netlink.GenericQdisc{
@@ -138,6 +237,12 @@ func main() {
 			}
 		}
 	}()
+
+	banlistPath := "/root/banlist.txt"
+	log.Printf("Monitoring %s for IPs to block...", banlistPath)
+	go monitorBanlist(banlistPath, objs.DropIpsMap, 5*time.Second)
+
+
 	<-stopper
 	log.Println("Detaching firewall and exiting...")
 }
