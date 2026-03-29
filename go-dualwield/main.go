@@ -170,6 +170,15 @@ func main() {
 		QdiscType: "clsact",
 	}
 	_ = netlink.QdiscAdd(qdisc) // Ignore error if it already exists
+	
+	defer func() {
+		log.Println("Cleaning up: Destroying clsact qdisc to detach firewall...")
+		if err := netlink.QdiscDel(qdisc); err != nil {
+			log.Printf("Warning: failed to delete qdisc: %v", err)
+		} else {
+			log.Println("Cleanup successful. Firewall detached and maps flushed.")
+		}
+	}()
 
 	// Attach the eBPF program (equivalent to: tc filter add dev br-lan ingress bpf da obj...)
 	filter := &netlink.BpfFilter{
@@ -186,7 +195,6 @@ func main() {
 	if err := netlink.FilterAdd(filter); err != nil {
 		log.Fatalf("Failed to attach eBPF filter: %v", err)
 	}
-	defer netlink.FilterDel(filter)
 
 	log.Printf("Successfully attached eBPF firewall to %s", ifaceName)
 
