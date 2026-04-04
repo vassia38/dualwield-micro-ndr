@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"strconv"
 	"syscall"
 	"time"
 	"github.com/cilium/ebpf"
@@ -24,16 +25,23 @@ import (
 
 // We must mirror the C struct in Go to decode the binary data coming from the perf buffer
 type flowKey struct {
-	SrcIP    uint32
-	DstIP    uint32
-	SrcPort  uint16
-	DstPort  uint16
-	Protocol uint8
-	_        [3]byte // Padding to match C struct alignment
+	IpA    		uint32
+	IpB    		uint32
+	PortA  		uint16
+	PortB  		uint16
+	Protocol 	uint8
+	_        	[3]byte // Padding to match C struct alignment
 }
 type flowStats struct {
-	Packets uint64
-	Bytes   uint64
+	PktsAToB 		uint64
+	BytesAToB		uint64
+	PktsBToA		uint64
+	BytesBToA		uint64
+	StartTimeNs uint64
+	LastTimeNs 	uint64
+	TcpFlags 		uint8
+	Initiator		uint8
+	_ 					[6]byte // Padding for 8-byte alignment
 }
 
 // Helper to convert network byte order IP (uint32) to Go net.IP
@@ -46,6 +54,10 @@ func intToIP(ipInt uint32) net.IP {
 // Helper to handle network byte order ports
 func ntohs(port uint16) uint16 {
 	return (port << 8) | (port >> 8)
+}
+
+func htons(port uint16) uint16 {
+	return ntohs(port)
 }
 
 // ipToUint32 converts a string IP to the uint32 format expected by the eBPF map.
@@ -71,7 +83,7 @@ func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) 
 	defer ticker.Stop()
 
 	// Cache to track what is currently in the eBPF map, saving unnecessary system calls
-	knownBans := make(map[uint32]bool)
+	knownBans := make(map[string]flowKey)
 
 	for range ticker.C {
 		file, err := os.Open(filepath)
@@ -83,49 +95,73 @@ func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) 
 		}
 
 		scanner := bufio.NewScanner(file)
-		currentFileIPs := make(map[uint32]bool)
+		currentFileBans := make(map[string]bool)
 
-		// 1. Read the file and ADD new bans
+		// Read the file and ADD new bans
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue // Skip empty lines and comments
 			}
 
-			ipInt, err := ipToUint32(line)
-			if err != nil {
-				log.Printf("Skipping invalid IP in banlist '%s': %v", line, err)
+			// Expected format: Protocol,Ip_a,Port_a,Ip_b,Port_b
+			parts :=strings.Split(line, ",")
+			if len(parts) != 5 {
+				log.Printf("Skipping invalid banlist entry (needs 5 parts): %s",line)
 				continue
 			}
 
-			currentFileIPs[ipInt] = true
+			protocol, _ := strconv.ParseUint(parts[0], 10, 8)
+			ip_a, errA := ipToUint32(parts[1])
+			port_a, _ := strconv.ParseUint(parts[2], 10, 16)
+			ip_b, errB := ipToUint32(parts[3])
+			port_b, _ := strconv.ParseUint(parts[4], 10, 16)
 
-			// If it's a new IP, push it to the kernel
-			if !knownBans[ipInt] {
+			if errA != nil || errB != nil {
+				continue
+			}
+
+			portNet_a := htons(uint16(port_a))
+			portNet_b := htons(uint16(port_a))
+
+			var fkey flowKey
+			fkey.Protocol = uint8(protocol)
+
+			isAToB := (ip_a < ip_b) || (ip_a == ip_b && port_a < port_b)
+			if isAToB {
+				fkey.IpA, fkey.IpB = ip_a, ip_b
+				fkey.PortA, fkey.PortB = portNet_a, portNet_b
+			} else {
+				fkey.IpA, fkey.IpB = ip_b, ip_a
+				fkey.PortA, fkey.PortB = portNet_b, portNet_a
+			}
+
+			currentFileBans[line] = true
+
+			if _, exists := knownBans[line]; !exists {
 				dummyValue := uint32(1)
-				if err := dropMap.Put(&ipInt, &dummyValue); err != nil {
-					log.Printf("Failed to block IP %s: %v", line, err)
+				if err := dropMap.Put(&fkey, &dummyValue); err == nil {
+					log.Printf("[QUARANTINE] blocked flow: %s", line)
+					knownBans[line] = fkey
 				} else {
-					log.Printf("[BANNED] Added %s to firewall drop map", line)
-					knownBans[ipInt] = true
+					log.Printf("Failed to add flow '%s' to block map: %v", line, err)
 				}
 			}
 		}
 		file.Close()
 
-		// 2. REMOVE bans that are no longer in the text file
-		for bannedIpInt := range knownBans {
-			if !currentFileIPs[bannedIpInt] {
-				if err := dropMap.Delete(&bannedIpInt); err != nil {
-					log.Printf("Failed to unblock IP: %v", err)
-				} else {
-					log.Printf("[UNBANNED] Removed %s from firewall drop map", intToIP(bannedIpInt).String())
-					delete(knownBans, bannedIpInt)
+		// REMOVE bans that are no longer in the text file
+		for bannedString, bannedFkey := range knownBans {
+			if !currentFileBans[bannedString] {
+				if err := dropMap.Delete(&bannedFkey); err == nil {
+					log.Printf("[UNBANNED] Removed %s from firewall drop map", bannedString)
+					delete(knownBans, bannedString)
 				}
 			}
 		}
 	}
 }
+
 
 func main() {
 	// 1. Load the compiled eBPF objects into the kernel
@@ -198,11 +234,13 @@ func main() {
 
 	log.Printf("Successfully attached eBPF firewall to %s", ifaceName)
 
-// 3. Set up the Polling Ticker (e.g., every 3 seconds)
+	// 3. Start Banlist Monitor and setup polling for ML features
+	
+	banlistPath := "/root/banlist.txt"
+	go monitorBanlist(banlistPath, objs.DropFlowsMap, 5*time.Second)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	// 4. Handle interrupts for clean shutdown
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 
@@ -218,38 +256,43 @@ func main() {
 				
 				// Create an iterator to walk through the active_flows map
 				iterator := objs.ActiveFlows.Iterate()
-
-				flowCount := 0
+				flowsFound := false
+				
 				for iterator.Next(&key, &stats) {
-					flowCount++
-					srcIP := intToIP(key.SrcIP)
-					dstIP := intToIP(key.DstIP)
-					srcPort := ntohs(key.SrcPort)
-					dstPort := ntohs(key.DstPort)
+					if !flowsFound {
+						fmt.Println("--- NEW ML BATCH ---")
+						flowsFound = true
+					}
 
-					fmt.Printf("[FLOW] Proto: %d | %s:%d -> %s:%d | Pkts: %d, Bytes: %d\n",
-						key.Protocol, srcIP, srcPort, dstIP, dstPort, stats.Packets, stats.Bytes)
+					var ip_a, ip_b uint32
+					var port_a, port_b uint16
+					var outPkts, outBytes, inPkts, inBytes uint64
 
-					// Optional: If you want to reset the flows so you only see new traffic
-					// each tick, you can delete the entry after reading it:
-					// _ = objs.ActiveFlows.Delete(&key)
-				}
-				
-				if err := iterator.Err(); err != nil {
-					log.Printf("Map iteration error: %v", err)
-				}
-				
-				if flowCount > 0 {
-					fmt.Println("---------------------------------------------------")
+					if stats.Initiator == 0 {
+						ip_a, ip_b = key.IpA, key.IpB
+						port_a, port_b = key.PortA, key.PortB
+						outPkts, outBytes = stats.PktsAToB, stats.BytesAToB
+						inPkts, inBytes = stats.PktsBToA, stats.BytesBToA
+					} else {
+						ip_a, ip_b = key.IpB, key.IpA
+						port_a, port_b = key.PortA, key.PortB
+						outPkts, outBytes = stats.PktsBToA, stats.BytesBToA
+						inPkts, inBytes = stats.PktsAToB, stats.BytesAToB
+					}
+
+					durationMs := (stats.LastTimeNs - stats.StartTimeNs) / 1000000
+
+					fmt.Printf("SRC:%s:%d DST:%s:%d | PROT:%d | IN_B:%d OUT_B:%d | IN_P:%d OUT_P:%d | FLAGS:%d | DUR:%dms\n",
+						intToIP(ip_a), ntohs(port_a),
+						intToIP(ip_b), ntohs(port_b),
+						key.Protocol,
+						inBytes, outBytes,
+						inPkts, outPkts,
+						stats.TcpFlags, durationMs)
 				}
 			}
 		}
 	}()
-
-	banlistPath := "/root/banlist.txt"
-	log.Printf("Monitoring %s for IPs to block...", banlistPath)
-	go monitorBanlist(banlistPath, objs.DropIpsMap, 5*time.Second)
-
 
 	<-stopper
 	log.Println("Detaching firewall and exiting...")
