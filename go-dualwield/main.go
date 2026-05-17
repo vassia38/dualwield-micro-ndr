@@ -169,6 +169,42 @@ func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) 
 	}
 }
 
+func getPrediction(scores []float64) int {
+	bestClass := 0
+	highestScore := scores[0]
+	
+	for classIndex, score := range scores {
+		if score > highestScore {
+			highestScore = score
+			bestClass = classIndex
+		}
+	}
+	return bestClass
+}
+
+var attackMap = map[int]string{
+	0: "Benign",
+	1: "DDoS",
+	2: "Reconnaissance",
+	3: "injection",
+	4: "DoS",
+	5: "Brute Force",
+	6: "password",
+	7: "xss",
+	8: "Infilteration",
+	9: "Exploits",
+	10: "scanning",
+	11: "Fuzzers",
+	12: "Backdoor",
+	13: "Bot",
+	14: "Generic",
+	15: "Analysis",
+	16: "Theft",
+	17: "Shellcode",
+	18: "mitm",
+	19: "Worms",
+	20: "ransomware",
+}
 
 func main() {
 	// 1. Load the compiled eBPF objects into the kernel
@@ -301,6 +337,43 @@ case <-ticker.C:
 						inBytes, outBytes,
 						inPkts, outPkts,
 						stats.TcpFlags, durationMs)
+
+					// construct the ML feature vector
+					// We use ntohs() so that the model gets the human-readable port, not the kernel byte order
+					features := []float64{
+						float64(ntohs(clientPort)), // L4_SRC_PORT
+						float64(ntohs(serverPort)), // L4_DST_PORT
+						float64(key.Protocol),      // PROTOCOL
+						float64(inBytes),           // IN_BYTES
+						float64(inPkts),            // IN_PKTS
+						float64(outBytes),          // OUT_BYTES
+						float64(outPkts),           // OUT_PKTS
+						float64(stats.TcpFlags),    // TCP_FLAGS
+						float64(durationMs),        // FLOW_DURATION_MILLISECONDS
+					}
+
+					scores := score(features)
+					predictedClass := getPrediction(scores)
+
+					if predictedClass == 0 {
+						// fmt.Printf("[BENIGN] %s:%d -> %s:%d\n", intToIP(clientIP), ntohs(clientPort), intToIP(serverIP), ntohs(serverPort))
+					} else {
+						attackName, known := attackMap[predictedClass]
+						if !known {
+							attackName = fmt.Sprintf("Unknown_Class_%d", predictedClass)
+						}
+
+						log.Printf("[THREAT DETECTED] %s:%d -> %s:%d | Type: %s | Action: QUARANTINE",
+							intToIP(clientIP), ntohs(clientPort),
+							intToIP(serverIP), ntohs(serverPort),
+							attackName)
+
+						// 4. Execute the Quarantine (Surgical 5-Tuple Block)
+						dummyValue := uint32(1)
+						if err := objs.DropFlowsMap.Put(&key, &dummyValue); err != nil {
+							log.Printf("   -> [ERROR] Failed to push quarantine to kernel: %v", err)
+						}
+					}
 
 					// --- EVICTION EVALUATION ---
 					shouldEvict := false
