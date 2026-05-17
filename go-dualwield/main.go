@@ -4,16 +4,18 @@ import (
 	//"bytes"
 	"bufio"
 	"encoding/binary"
+
 	//"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
+
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -25,23 +27,23 @@ import (
 
 // We must mirror the C struct in Go to decode the binary data coming from the perf buffer
 type flowKey struct {
-	IpA    		uint32
-	IpB    		uint32
-	PortA  		uint16
-	PortB  		uint16
-	Protocol 	uint8
-	_        	[3]byte // Padding to match C struct alignment
+	IpA      uint32
+	IpB      uint32
+	PortA    uint16
+	PortB    uint16
+	Protocol uint8
+	_        [3]byte // Padding to match C struct alignment
 }
 type flowStats struct {
-	PktsAToB 		uint64
-	BytesAToB		uint64
-	PktsBToA		uint64
-	BytesBToA		uint64
+	PktsAToB    uint64
+	BytesAToB   uint64
+	PktsBToA    uint64
+	BytesBToA   uint64
 	StartTimeNs uint64
-	LastTimeNs 	uint64
-	TcpFlags 		uint8
-	Initiator		uint8
-	_ 					[6]byte // Padding for 8-byte alignment
+	LastTimeNs  uint64
+	TcpFlags    uint8
+	Initiator   uint8
+	_           [6]byte // Padding for 8-byte alignment
 }
 
 // Helper to convert network byte order IP (uint32) to Go net.IP
@@ -60,37 +62,71 @@ func htons(port uint16) uint16 {
 	return ntohs(port)
 }
 
-// ipToUint32 converts a string IP to the uint32 format expected by the eBPF map.
+// ipToUint32 converts a string IPv4 address into the raw 4-byte layout used by the eBPF key.
+// This preserves the same byte order that the kernel packet parser writes into the flow key.
 func ipToUint32(ipStr string) (uint32, error) {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return 0, fmt.Errorf("invalid IP format")
 	}
-	
+
 	ip = ip.To4()
 	if ip == nil {
 		return 0, fmt.Errorf("not an IPv4 address")
 	}
 
-	// MT7621 is Little-Endian. The C code reads the 4-byte network IP directly 
+	// MT7621 is Little-Endian. The C code reads the 4-byte network IP directly
 	// into a uint32, so we must pack the bytes exactly as they appear in memory.
 	return binary.LittleEndian.Uint32(ip), nil
 }
 
-// getKtimeNs returns the current CLOCK_MONOTONIC time in nanoseconds, 
+// getKtimeNs returns the current CLOCK_MONOTONIC time in nanoseconds,
 func getKtimeNs() uint64 {
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	return uint64(ts.Sec)*1e9 + uint64(ts.Nsec)
 }
 
-// monitorBanlist reads a text file and syncs it with the eBPF drop map.
+// parsePortField accepts numeric ports or wildcard indicators ('*', 'any', '0').
+// Returns the port as uint16 where 0 denotes a wildcard (match any port).
+func parsePortField(s string) (uint16, error) {
+	s = strings.TrimSpace(s)
+	if s == "*" || strings.EqualFold(s, "any") || s == "0" {
+		return 0, nil
+	}
+	v, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		return 0, err
+	}
+	return uint16(v), nil
+}
+
+// canonicalKeyString returns a normalized textual representation of a flowKey.
+// Ports with value 0 are shown as '*' to indicate wildcard.
+func canonicalKeyString(k flowKey) string {
+	srcPort := "*"
+	dstPort := "*"
+	if k.PortA != 0 {
+		srcPort = strconv.FormatUint(uint64(ntohs(k.PortA)), 10)
+	}
+	if k.PortB != 0 {
+		dstPort = strconv.FormatUint(uint64(ntohs(k.PortB)), 10)
+	}
+	return fmt.Sprintf("%d,%s,%s,%s,%s",
+		k.Protocol,
+		intToIP(k.IpA).String(),
+		srcPort,
+		intToIP(k.IpB).String(),
+		dstPort)
+}
+
+// read a text file and syncs it with the eBPF drop map.
 func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Cache to track what is currently in the eBPF map, saving unnecessary system calls
-	knownBans := make(map[string]flowKey)
+	knownBans := make(map[flowKey]struct{})
 
 	for range ticker.C {
 		file, err := os.Open(filepath)
@@ -102,7 +138,7 @@ func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) 
 		}
 
 		scanner := bufio.NewScanner(file)
-		currentFileBans := make(map[string]bool)
+		currentFileBans := make(map[flowKey]struct{})
 
 		// Read the file and ADD new bans
 		for scanner.Scan() {
@@ -112,29 +148,30 @@ func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) 
 			}
 
 			// Expected format: Protocol,Ip_a,Port_a,Ip_b,Port_b
-			parts :=strings.Split(line, ",")
+			parts := strings.Split(line, ",")
 			if len(parts) != 5 {
-				log.Printf("Skipping invalid banlist entry (needs 5 parts): %s",line)
+				log.Printf("Skipping invalid banlist entry (needs 5 parts): %s", line)
 				continue
 			}
 
-			protocol, _ := strconv.ParseUint(parts[0], 10, 8)
+			protocol, errP := strconv.ParseUint(parts[0], 10, 8)
 			ip_a, errA := ipToUint32(parts[1])
-			port_a, _ := strconv.ParseUint(parts[2], 10, 16)
+			port_a_u16, errAP := parsePortField(parts[2])
 			ip_b, errB := ipToUint32(parts[3])
-			port_b, _ := strconv.ParseUint(parts[4], 10, 16)
+			port_b_u16, errBP := parsePortField(parts[4])
 
-			if errA != nil || errB != nil {
+			if errP != nil || errA != nil || errB != nil || errAP != nil || errBP != nil {
+				log.Printf("Skipping invalid banlist entry: %s", line)
 				continue
 			}
 
-			portNet_a := htons(uint16(port_a))
-			portNet_b := htons(uint16(port_a))
+			portNet_a := htons(port_a_u16)
+			portNet_b := htons(port_b_u16)
 
 			var fkey flowKey
 			fkey.Protocol = uint8(protocol)
 
-			isAToB := (ip_a < ip_b) || (ip_a == ip_b && port_a < port_b)
+			isAToB := (ip_a < ip_b) || (ip_a == ip_b && uint32(port_a_u16) < uint32(port_b_u16))
 			if isAToB {
 				fkey.IpA, fkey.IpB = ip_a, ip_b
 				fkey.PortA, fkey.PortB = portNet_a, portNet_b
@@ -143,26 +180,33 @@ func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) 
 				fkey.PortA, fkey.PortB = portNet_b, portNet_a
 			}
 
-			currentFileBans[line] = true
+			currentFileBans[fkey] = struct{}{}
 
-			if _, exists := knownBans[line]; !exists {
+			if _, exists := knownBans[fkey]; !exists {
 				dummyValue := uint32(1)
 				if err := dropMap.Put(&fkey, &dummyValue); err == nil {
-					log.Printf("[QUARANTINE] blocked flow: %s", line)
-					knownBans[line] = fkey
+					log.Printf("[QUARANTINE] blocked flow: %s", canonicalKeyString(fkey))
+					knownBans[fkey] = struct{}{}
 				} else {
-					log.Printf("Failed to add flow '%s' to block map: %v", line, err)
+					log.Printf("Failed to add flow '%s' to block map: %v", canonicalKeyString(fkey), err)
 				}
 			}
 		}
+
+		if err := scanner.Err(); err != nil {
+			log.Printf("Error reading banlist: %v", err)
+		}
+
 		file.Close()
 
 		// REMOVE bans that are no longer in the text file
-		for bannedString, bannedFkey := range knownBans {
-			if !currentFileBans[bannedString] {
+		for bannedFkey := range knownBans {
+			if _, present := currentFileBans[bannedFkey]; !present {
 				if err := dropMap.Delete(&bannedFkey); err == nil {
-					log.Printf("[UNBANNED] Removed %s from firewall drop map", bannedString)
-					delete(knownBans, bannedString)
+					log.Printf("[UNBANNED] Removed %s from firewall drop map", canonicalKeyString(bannedFkey))
+					delete(knownBans, bannedFkey)
+				} else {
+					log.Printf("Failed to remove flow from drop map: %v", err)
 				}
 			}
 		}
@@ -172,7 +216,7 @@ func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) 
 func getPrediction(scores []float64) int {
 	bestClass := 0
 	highestScore := scores[0]
-	
+
 	for classIndex, score := range scores {
 		if score > highestScore {
 			highestScore = score
@@ -183,16 +227,16 @@ func getPrediction(scores []float64) int {
 }
 
 var attackMap = map[int]string{
-	0: "Benign",
-	1: "DDoS",
-	2: "Reconnaissance",
-	3: "injection",
-	4: "DoS",
-	5: "Brute Force",
-	6: "password",
-	7: "xss",
-	8: "Infilteration",
-	9: "Exploits",
+	0:  "Benign",
+	1:  "DDoS",
+	2:  "Reconnaissance",
+	3:  "injection",
+	4:  "DoS",
+	5:  "Brute Force",
+	6:  "password",
+	7:  "xss",
+	8:  "Infilteration",
+	9:  "Exploits",
 	10: "scanning",
 	11: "Fuzzers",
 	12: "Backdoor",
@@ -218,7 +262,7 @@ func main() {
 	fmt.Print("Enter the interface name to attach the firewall (e.g., br-lan, eth0, eth1): ")
 	// Create a reader to read from standard input (the keyboard)
 	reader := bufio.NewReader(os.Stdin)
-	inputName, err := reader.ReadString('\n')	
+	inputName, err := reader.ReadString('\n')
 	if err != nil {
 		log.Fatalf("Failed to read input: %v", err)
 	}
@@ -238,7 +282,6 @@ func main() {
 		log.Fatalf("Failed to find interface '%s': %v\n(Check 'ip link' to see available interfaces)", ifaceName, err)
 	}
 
-
 	// Create the clsact qdisc (equivalent to: tc qdisc add dev br-lan clsact)
 	qdisc := &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{
@@ -249,7 +292,7 @@ func main() {
 		QdiscType: "clsact",
 	}
 	_ = netlink.QdiscAdd(qdisc) // Ignore error if it already exists
-	
+
 	defer func() {
 		log.Println("Cleaning up: Destroying clsact qdisc to detach firewall...")
 		if err := netlink.QdiscDel(qdisc); err != nil {
@@ -275,10 +318,16 @@ func main() {
 		log.Fatalf("Failed to attach eBPF filter: %v", err)
 	}
 
+	defer func() {
+		if err := netlink.FilterDel(filter); err != nil {
+			log.Printf("Warning: failed to remove eBPF filter: %v", err)
+		}
+	}()
+
 	log.Printf("Successfully attached eBPF firewall to %s", ifaceName)
 
 	// 3. Start Banlist Monitor and setup polling for ML features
-	
+
 	banlistPath := "/root/banlist.txt"
 	go monitorBanlist(banlistPath, objs.DropFlowsMap, 5*time.Second)
 	ticker := time.NewTicker(3 * time.Second)
@@ -293,7 +342,7 @@ func main() {
 	go func() {
 		for {
 			select {
-case <-ticker.C:
+			case <-ticker.C:
 				var key flowKey
 				var stats flowStats
 
@@ -368,9 +417,24 @@ case <-ticker.C:
 							intToIP(serverIP), ntohs(serverPort),
 							attackName)
 
-						// 4. Execute the Quarantine (Surgical 5-Tuple Block)
+						// 4. quarantine (5-tuple or IP wildcard block for DoS)
 						dummyValue := uint32(1)
-						if err := objs.DropFlowsMap.Put(&key, &dummyValue); err != nil {
+
+						// If this is a DDoS class, insert an IP wildcard ban to block the attacker IP
+						// regardless of the destination port. The eBPF program treats port==0 as
+						// a wildcard port and ip==0 as a wildcard IP in the lookup logic.
+						banKey := key
+						if predictedClass == 1 { // DDoS
+							banKey.IpA = 0
+							banKey.IpB = clientIP
+							banKey.PortA = 0
+							banKey.PortB = 0
+							log.Printf("   -> [QUARANTINE-IP] applying attacker-IP wildcard block: %s", canonicalKeyString(banKey))
+						} else {
+							log.Printf("   -> [QUARANTINE] applying flow block: %s", canonicalKeyString(banKey))
+						}
+
+						if err := objs.DropFlowsMap.Put(&banKey, &dummyValue); err != nil {
 							log.Printf("   -> [ERROR] Failed to push quarantine to kernel: %v", err)
 						}
 					}
@@ -379,7 +443,7 @@ case <-ticker.C:
 					shouldEvict := false
 
 					// 1. TCP Closed Check (FIN or RST flag seen)
-					if key.Protocol == 6 { 
+					if key.Protocol == 6 {
 						// TCP Flags: FIN is 0x01, RST is 0x04
 						if (stats.TcpFlags & (0x01 | 0x04)) != 0 {
 							shouldEvict = true
@@ -400,6 +464,10 @@ case <-ticker.C:
 				// --- EXECUTE EVICTION ---
 				for _, evictKey := range flowsToEvict {
 					_ = objs.ActiveFlows.Delete(&evictKey)
+				}
+
+				if err := iterator.Err(); err != nil {
+					log.Printf("Error iterating ActiveFlows map: %v", err)
 				}
 
 				if len(flowsToEvict) > 0 {

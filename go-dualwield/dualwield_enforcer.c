@@ -145,6 +145,22 @@ struct {
   __type(value, __u32);
 } drop_flows_map SEC(".maps");
 
+// Helper: create a canonical flow_key from two IPs and ports.
+static __inline void make_canonical(__u32 ip1, __u32 ip2, __u16 p1, __u16 p2, __u8 proto, struct flow_key *out) {
+  if ((ip1 < ip2) || (ip1 == ip2 && p1 <= p2)) {
+    out->ip_a = ip1;
+    out->ip_b = ip2;
+    out->port_a = p1;
+    out->port_b = p2;
+  } else {
+    out->ip_a = ip2;
+    out->ip_b = ip1;
+    out->port_a = p2;
+    out->port_b = p1;
+  }
+  out->protocol = proto;
+}
+
 // =================================
 // PACKET PROCCESSING LOGIC
 // =================================
@@ -230,7 +246,30 @@ int dualwield_enforcer(struct __sk_buff *skb) {
 
   // --- Quarantine check ---
 
-  __u32 *is_blocked = bpf_map_lookup_elem(&drop_flows_map, &fkey);
+  // Try several map lookup patterns to support wildcards (port==0 => any port,
+  // ip==0 => any IP). We canonicalize keys the same way as when inserting bans.
+  struct flow_key try;
+  __u32 *is_blocked = NULL;
+
+  // 1) exact match
+  is_blocked = bpf_map_lookup_elem(&drop_flows_map, &fkey);
+  if (is_blocked)
+    return TC_ACT_SHOT;
+
+  // 2) wildcard ports between the same IP pair (port_a=0, port_b=0)
+  make_canonical(fkey.ip_a, fkey.ip_b, 0, 0, fkey.protocol, &try);
+  is_blocked = bpf_map_lookup_elem(&drop_flows_map, &try);
+  if (is_blocked)
+    return TC_ACT_SHOT;
+
+  // 3) IP wildcard: attacker IP to any destination. Try both src and dst as attacker.
+  make_canonical(src_ip, 0, 0, 0, fkey.protocol, &try);
+  is_blocked = bpf_map_lookup_elem(&drop_flows_map, &try);
+  if (is_blocked)
+    return TC_ACT_SHOT;
+
+  make_canonical(dst_ip, 0, 0, 0, fkey.protocol, &try);
+  is_blocked = bpf_map_lookup_elem(&drop_flows_map, &try);
   if (is_blocked)
     return TC_ACT_SHOT;
 
