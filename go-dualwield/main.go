@@ -77,6 +77,13 @@ func ipToUint32(ipStr string) (uint32, error) {
 	return binary.LittleEndian.Uint32(ip), nil
 }
 
+// getKtimeNs returns the current CLOCK_MONOTONIC time in nanoseconds, 
+func getKtimeNs() uint64 {
+	var ts unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return uint64(ts.Sec)*1e9 + uint64(ts.Nsec)
+}
+
 // monitorBanlist reads a text file and syncs it with the eBPF drop map.
 func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -250,32 +257,37 @@ func main() {
 	go func() {
 		for {
 			select {
-			case <-ticker.C:
+case <-ticker.C:
 				var key flowKey
 				var stats flowStats
-				
-				// Create an iterator to walk through the active_flows map
+
+				nowNs := getKtimeNs()
+				timeoutNs := uint64(60 * time.Second.Nanoseconds()) // 60 seconds
+
+				// Slice to hold flows we need to delete after iterating
+				var flowsToEvict []flowKey
+
 				iterator := objs.ActiveFlows.Iterate()
 				flowsFound := false
-				
+
 				for iterator.Next(&key, &stats) {
 					if !flowsFound {
 						fmt.Println("--- NEW ML BATCH ---")
 						flowsFound = true
 					}
 
-					var ip_a, ip_b uint32
-					var port_a, port_b uint16
+					var clientIP, serverIP uint32
+					var clientPort, serverPort uint16
 					var outPkts, outBytes, inPkts, inBytes uint64
 
-					if stats.Initiator == 0 {
-						ip_a, ip_b = key.IpA, key.IpB
-						port_a, port_b = key.PortA, key.PortB
+					if stats.Initiator == 1 {
+						clientIP, serverIP = key.IpA, key.IpB
+						clientPort, serverPort = key.PortA, key.PortB
 						outPkts, outBytes = stats.PktsAToB, stats.BytesAToB
 						inPkts, inBytes = stats.PktsBToA, stats.BytesBToA
 					} else {
-						ip_a, ip_b = key.IpB, key.IpA
-						port_a, port_b = key.PortA, key.PortB
+						clientIP, serverIP = key.IpB, key.IpA
+						clientPort, serverPort = key.PortB, key.PortA
 						outPkts, outBytes = stats.PktsBToA, stats.BytesBToA
 						inPkts, inBytes = stats.PktsAToB, stats.BytesAToB
 					}
@@ -283,12 +295,42 @@ func main() {
 					durationMs := (stats.LastTimeNs - stats.StartTimeNs) / 1000000
 
 					fmt.Printf("SRC:%s:%d DST:%s:%d | PROT:%d | IN_B:%d OUT_B:%d | IN_P:%d OUT_P:%d | FLAGS:%d | DUR:%dms\n",
-						intToIP(ip_a), ntohs(port_a),
-						intToIP(ip_b), ntohs(port_b),
+						intToIP(clientIP), ntohs(clientPort),
+						intToIP(serverIP), ntohs(serverPort),
 						key.Protocol,
 						inBytes, outBytes,
 						inPkts, outPkts,
 						stats.TcpFlags, durationMs)
+
+					// --- EVICTION EVALUATION ---
+					shouldEvict := false
+
+					// 1. TCP Closed Check (FIN or RST flag seen)
+					if key.Protocol == 6 { 
+						// TCP Flags: FIN is 0x01, RST is 0x04
+						if (stats.TcpFlags & (0x01 | 0x04)) != 0 {
+							shouldEvict = true
+						}
+					}
+
+					// 2. Stale / Idle Timeout Check (No packets in 60 seconds)
+					if (nowNs - stats.LastTimeNs) > timeoutNs {
+						shouldEvict = true
+					}
+
+					// Tag for deletion
+					if shouldEvict {
+						flowsToEvict = append(flowsToEvict, key)
+					}
+				}
+
+				// --- EXECUTE EVICTION ---
+				for _, evictKey := range flowsToEvict {
+					_ = objs.ActiveFlows.Delete(&evictKey)
+				}
+
+				if len(flowsToEvict) > 0 {
+					log.Printf("[HOUSEKEEPING] Evicted %d closed/stale flows from kernel memory", len(flowsToEvict))
 				}
 			}
 		}

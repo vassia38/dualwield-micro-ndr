@@ -1,0 +1,4 @@
+# build:
+
+go generate
+GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -o fw_agent

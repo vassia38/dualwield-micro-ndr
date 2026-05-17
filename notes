@@ -16,3 +16,14 @@ make defconfig download clean world
 # Cum incarc un fisier de reguli ??
 #
 # Stabilesc un set despre CE FILTREZ (cum ma bate capul , sa acopere chestiunile curente)
+#
+#
+#
+#
+# Bypassing CO-RE and BTF Limits: OpenWrt strips out the BTF data required for modern eBPF compilation. We bypassed this by manually defining the exact Linux networking structures and types, allowing the Go loader to safely inject the bytecode without crashing.
+#
+# Eliminating the "Reverse Shell" Blind Spot: We abandoned fragile userspace port-guessing heuristics. By having the kernel track the TCP SYN flag to determine the "Initiator," our firewall accurately identifies the Client and Server regardless of what bizarre ports an attacker uses.
+#
+# Surgical Quarantine vs. Sledgehammer Blocking: Instead of banning entire IP addresses (which can cause self-inflicted DoS on shared hosting providers), we implemented a Canonical 5-Tuple blocklist. The firewall now surgically assassinates specific malicious conversations while letting legitimate traffic to the exact same IP pass untouched.
+#
+# Zero Zombie Hooks: We implemented a bulletproof cleanup routine that destroys the entire clsact qdisc on exit, ensuring the router's memory and networking stack remain pristine if the agent crashes or shuts down.
