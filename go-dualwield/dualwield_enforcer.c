@@ -248,7 +248,7 @@ int dualwield_enforcer(struct __sk_buff *skb) {
 
   // Try several map lookup patterns to support wildcards (port==0 => any port,
   // ip==0 => any IP). We canonicalize keys the same way as when inserting bans.
-  struct flow_key try;
+  struct flow_key try = {};
   __u32 *is_blocked = NULL;
 
   // 1) exact match
