@@ -87,6 +87,22 @@ func getKtimeNs() uint64 {
 	return uint64(ts.Sec)*1e9 + uint64(ts.Nsec)
 }
 
+const (
+	banlistPath = "/root/banlist.txt"
+	alertsPath  = "/root/alerts.txt"
+)
+
+var autoBanClasses = map[int]struct{}{
+	1:  {}, // DDoS
+	4:  {}, // DoS
+	8:  {}, // Infiltration
+	12: {}, // Backdoor
+	13: {}, // Bot
+	16: {}, // Theft
+	17: {}, // Shellcode
+	20: {}, // ransomware
+}
+
 // parsePortField accepts numeric ports or wildcard indicators ('*', 'any', '0').
 // Returns the port as uint16 where 0 denotes a wildcard (match any port).
 func parsePortField(s string) (uint16, error) {
@@ -118,6 +134,67 @@ func canonicalKeyString(k flowKey) string {
 		srcPort,
 		intToIP(k.IpB).String(),
 		dstPort)
+}
+
+func flowKeyToBanlistLine(k flowKey) string {
+	srcPort := "*"
+	dstPort := "*"
+	if k.PortA != 0 {
+		srcPort = strconv.FormatUint(uint64(ntohs(k.PortA)), 10)
+	}
+	if k.PortB != 0 {
+		dstPort = strconv.FormatUint(uint64(ntohs(k.PortB)), 10)
+	}
+	return fmt.Sprintf("%d,%s,%s,%s,%s",
+		k.Protocol,
+		intToIP(k.IpA).String(),
+		srcPort,
+		intToIP(k.IpB).String(),
+		dstPort)
+}
+
+func appendUniqueLine(path, line string) error {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return nil
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	for _, existing := range strings.Split(string(content), "\n") {
+		if strings.TrimSpace(existing) == line {
+			return nil
+		}
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func persistAlert(k flowKey, attackName string) {
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	line := fmt.Sprintf("%s,%s,%s", timestamp, attackName, canonicalKeyString(k))
+	if err := appendUniqueLine(alertsPath, line); err != nil {
+		log.Printf("Failed to persist alert: %v", err)
+	}
+}
+
+func persistBanlistEntry(k flowKey) {
+	line := flowKeyToBanlistLine(k)
+	if err := appendUniqueLine(banlistPath, line); err != nil {
+		log.Printf("Failed to persist banlist entry: %v", err)
+	}
 }
 
 // read a text file and syncs it with the eBPF drop map.
@@ -328,7 +405,6 @@ func main() {
 
 	// 3. Start Banlist Monitor and setup polling for ML features
 
-	banlistPath := "/root/banlist.txt"
 	go monitorBanlist(banlistPath, objs.DropFlowsMap, 5*time.Second)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -436,37 +512,32 @@ func main() {
 
 						if err := objs.DropFlowsMap.Put(&banKey, &dummyValue); err != nil {
 							log.Printf("   -> [ERROR] Failed to push quarantine to kernel: %v", err)
+					} else {
+						if _, auto := autoBanClasses[predictedClass]; auto {
+							persistBanlistEntry(banKey)
 						}
-					}
+						persistAlert(banKey, attackName)
 
-					// --- EVICTION EVALUATION ---
-					shouldEvict := false
+						shouldEvict := false
 
-					// 1. TCP Closed Check (FIN or RST flag seen)
-					if key.Protocol == 6 {
-						// TCP Flags: FIN is 0x01, RST is 0x04
-						if (stats.TcpFlags & (0x01 | 0x04)) != 0 {
+						// 1. TCP Closed Check (FIN or RST flag seen)
+						if key.Protocol == 6 {
+							// TCP Flags: FIN is 0x01, RST is 0x04
+							if (stats.TcpFlags & (0x01 | 0x04)) != 0 {
+								shouldEvict = true
+							}
+						}
+
+						// 2. Stale / Idle Timeout Check (No packets in 60 seconds)
+						if (nowNs - stats.LastTimeNs) > timeoutNs {
 							shouldEvict = true
 						}
+
+						// Tag for deletion
+						if shouldEvict {
+							flowsToEvict = append(flowsToEvict, key)
+						}
 					}
-
-					// 2. Stale / Idle Timeout Check (No packets in 60 seconds)
-					if (nowNs - stats.LastTimeNs) > timeoutNs {
-						shouldEvict = true
-					}
-
-					// Tag for deletion
-					if shouldEvict {
-						flowsToEvict = append(flowsToEvict, key)
-					}
-				}
-
-				// --- EXECUTE EVICTION ---
-				for _, evictKey := range flowsToEvict {
-					_ = objs.ActiveFlows.Delete(&evictKey)
-				}
-
-				if err := iterator.Err(); err != nil {
 					log.Printf("Error iterating ActiveFlows map: %v", err)
 				}
 
