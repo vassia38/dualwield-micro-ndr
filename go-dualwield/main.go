@@ -8,6 +8,7 @@ import (
 	//"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -88,8 +89,9 @@ func getKtimeNs() uint64 {
 }
 
 const (
-	banlistPath = "/root/banlist.txt"
-	alertsPath  = "/root/alerts.txt"
+	banlistPath   = "/root/banlist.txt"
+	alertsPath    = "/root/alerts.txt"
+	socReviewPath = "/root/soc_review.txt"
 )
 
 var autoBanClasses = map[int]struct{}{
@@ -190,11 +192,102 @@ func persistAlert(k flowKey, attackName string) {
 	}
 }
 
+// persistSocReview logs cases where binary model detected malicious but multiclass model detected benign.
+// These are high-confidence uncertain cases that warrant manual SOC team inspection.
+func persistSocReview(k flowKey, binaryConf float64, multiclassClass int, multiclassConf float64) {
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	className := attackMap[multiclassClass]
+	// Format: timestamp,src:port,dst:port,protocol,binary_confidence,multiclass_prediction,multiclass_confidence,reason
+	reason := "[TWO-STAGE-MISMATCH] Binary classifier detected malicious but multiclass detected benign"
+	line := fmt.Sprintf("%s,%s,%.4f,%s,%.4f,%s",
+		timestamp,
+		canonicalKeyString(k),
+		binaryConf,
+		className,
+		multiclassConf,
+		reason)
+	if err := appendUniqueLine(socReviewPath, line); err != nil {
+		log.Printf("Failed to persist SOC review entry: %v", err)
+	}
+}
+
 func persistBanlistEntry(k flowKey) {
 	line := flowKeyToBanlistLine(k)
 	if err := appendUniqueLine(banlistPath, line); err != nil {
 		log.Printf("Failed to persist banlist entry: %v", err)
 	}
+}
+
+// returns (predictedClass, confidencePickingPredictedClass)
+func predictAndConfidence(scores []float64) (int, float64) {
+	n := len(scores)
+	if n == 0 {
+		return 0, 0.0
+	}
+
+	// check if scores already sum to ~1
+	var sum float64
+	for _, v := range scores {
+		sum += v
+	}
+	const eps = 1e-6
+
+	var probs []float64
+	if math.Abs(sum-1.0) < eps && sum > 0 {
+		// likely already probabilities
+		probs = make([]float64, n)
+		copy(probs, scores)
+	} else {
+		// if all non-negative, normalize by sum (vote-count style)
+		allNonNeg := true
+		for _, v := range scores {
+			if v < 0 {
+				allNonNeg = false
+				break
+			}
+		}
+		if allNonNeg && sum > 0 {
+			probs = make([]float64, n)
+			for i, v := range scores {
+				probs[i] = v / sum
+			}
+		} else {
+			// fallback: softmax for arbitrary real-valued scores
+			max := scores[0]
+			for _, v := range scores {
+				if v > max {
+					max = v
+				}
+			}
+			exps := make([]float64, n)
+			var expSum float64
+			for i, v := range scores {
+				e := math.Exp(v - max)
+				exps[i] = e
+				expSum += e
+			}
+			probs = make([]float64, n)
+			for i := range exps {
+				probs[i] = exps[i] / expSum
+			}
+		}
+	}
+
+	// argmax + confidence
+	bestIdx := 0
+	bestVal := probs[0]
+	secondBest := 0.0
+	for i, p := range probs {
+		if p > bestVal {
+			secondBest = bestVal
+			bestVal = p
+			bestIdx = i
+		} else if p > secondBest && i != bestIdx {
+			secondBest = p
+		}
+	}
+	// optional margin = bestVal - secondBest
+	return bestIdx, bestVal
 }
 
 // read a text file and syncs it with the eBPF drop map.
@@ -477,67 +570,102 @@ func main() {
 						float64(durationMs),        // FLOW_DURATION_MILLISECONDS
 					}
 
-					scores := score(features)
-					predictedClass := getPrediction(scores)
+					// ========== TWO-STAGE ANALYSIS PIPELINE ==========
+					// STAGE 1: Binary Classifier (Benign vs Malicious)
+					binaryScores := binaryScore(features)
+					binaryPrediction, binaryConfidence := predictAndConfidence(binaryScores)
 
-					if predictedClass == 0 {
-						// fmt.Printf("[BENIGN] %s:%d -> %s:%d\n", intToIP(clientIP), ntohs(clientPort), intToIP(serverIP), ntohs(serverPort))
+					// default eviction flag
+					shouldEvict := false
+
+					if binaryPrediction == 0 {
+						// STAGE 1 -> Benign: No further analysis needed
+						// Omit verbose logging unless debugging
+						// fmt.Printf("[BENIGN] %s:%d -> %s:%d (confidence: %.4f)\n",
+						//    intToIP(clientIP), ntohs(clientPort),
+						//    intToIP(serverIP), ntohs(serverPort), binaryConfidence)
 					} else {
-						attackName, known := attackMap[predictedClass]
-						if !known {
-							attackName = fmt.Sprintf("Unknown_Class_%d", predictedClass)
-						}
-
-						log.Printf("[THREAT DETECTED] %s:%d -> %s:%d | Type: %s | Action: QUARANTINE",
+						// stage 1 detected malicious
+						log.Printf("[STAGE-1 ALERT] Binary classifier detected malicious traffic from %s:%d -> %s:%d (confidence: %.4f)",
 							intToIP(clientIP), ntohs(clientPort),
 							intToIP(serverIP), ntohs(serverPort),
-							attackName)
+							binaryConfidence)
 
-						// 4. quarantine (5-tuple or IP wildcard block for DoS)
-						dummyValue := uint32(1)
+						// STAGE 2: Multi-Class Classifier
+						multiclassScores := multiclassScore(features)
+						multiclassPrediction, multiclassConfidence := predictAndConfidence(multiclassScores)
 
-						// If this is a DDoS class, insert an IP wildcard ban to block the attacker IP
-						// regardless of the destination port. The eBPF program treats port==0 as
-						// a wildcard port and ip==0 as a wildcard IP in the lookup logic.
-						banKey := key
-						if predictedClass == 1 { // DDoS
-							banKey.IpA = 0
-							banKey.IpB = clientIP
-							banKey.PortA = 0
-							banKey.PortB = 0
-							log.Printf("   -> [QUARANTINE-IP] applying attacker-IP wildcard block: %s", canonicalKeyString(banKey))
+						attackName, known := attackMap[multiclassPrediction]
+						if !known {
+							attackName = fmt.Sprintf("Unknown_Class_%d", multiclassPrediction)
+						}
+
+						if multiclassPrediction == 0 {
+							// EDGE CASE: Binary says Malicious, but Multiclass says Benign
+							// This is a high-confidence uncertain case for SOC review
+							log.Printf("[TWO-STAGE-MISMATCH] Binary→Malicious (%.4f) but Multiclass→Benign (%.4f) | Flow: %s:%d → %s:%d | LOGGED FOR SOC REVIEW",
+								binaryConfidence, multiclassConfidence,
+								intToIP(clientIP), ntohs(clientPort),
+								intToIP(serverIP), ntohs(serverPort))
+							persistSocReview(key, binaryConfidence, multiclassPrediction, multiclassConfidence)
 						} else {
-							log.Printf("   -> [QUARANTINE] applying flow block: %s", canonicalKeyString(banKey))
-						}
+							// Both stages agree: Malicious -> Apply quarantine logic
+							log.Printf("[THREAT DETECTED] %s:%d -> %s:%d | Type: %s | Confidence: %.4f | Action: QUARANTINE",
+								intToIP(clientIP), ntohs(clientPort),
+								intToIP(serverIP), ntohs(serverPort),
+								attackName, multiclassConfidence)
 
-						if err := objs.DropFlowsMap.Put(&banKey, &dummyValue); err != nil {
-							log.Printf("   -> [ERROR] Failed to push quarantine to kernel: %v", err)
-					} else {
-						if _, auto := autoBanClasses[predictedClass]; auto {
-							persistBanlistEntry(banKey)
-						}
-						persistAlert(banKey, attackName)
+							// Apply quarantine (5-tuple or IP wildcard block for DDoS)
+							dummyValue := uint32(1)
 
-						shouldEvict := false
+							// If this is a DDoS class, insert an IP wildcard ban to block the attacker IP
+							// regardless of the destination port. The eBPF program treats port==0 as
+							// a wildcard port and ip==0 as a wildcard IP in the lookup logic.
+							banKey := key
+							if multiclassPrediction == 1 { // DDoS
+								banKey.IpA = 0
+								banKey.IpB = clientIP
+								banKey.PortA = 0
+								banKey.PortB = 0
+								log.Printf("   -> [QUARANTINE-IP] applying attacker-IP wildcard block: %s", canonicalKeyString(banKey))
+							} else {
+								log.Printf("   -> [QUARANTINE] applying flow block: %s", canonicalKeyString(banKey))
+							}
 
-						// 1. TCP Closed Check (FIN or RST flag seen)
-						if key.Protocol == 6 {
-							// TCP Flags: FIN is 0x01, RST is 0x04
-							if (stats.TcpFlags & (0x01 | 0x04)) != 0 {
-								shouldEvict = true
+							if err := objs.DropFlowsMap.Put(&banKey, &dummyValue); err != nil {
+								log.Printf("   -> [ERROR] Failed to push quarantine to kernel: %v", err)
+							} else {
+								// Persist to banlist if this is an auto-ban class
+								if _, auto := autoBanClasses[multiclassPrediction]; auto {
+									persistBanlistEntry(banKey)
+								}
+								persistAlert(banKey, attackName)
 							}
 						}
+					}
 
-						// 2. Stale / Idle Timeout Check (No packets in 60 seconds)
-						if (nowNs - stats.LastTimeNs) > timeoutNs {
+					// ========== FLOW EVICTION LOGIC ==========
+					// Always check if flow should be evicted (TCP closed or idle timeout)
+					// 1. TCP Closed Check (FIN or RST flag seen)
+					if key.Protocol == 6 {
+						// TCP Flags: FIN is 0x01, RST is 0x04
+						if (stats.TcpFlags & (0x01 | 0x04)) != 0 {
 							shouldEvict = true
 						}
-
-						// Tag for deletion
-						if shouldEvict {
-							flowsToEvict = append(flowsToEvict, key)
-						}
 					}
+
+					// 2. Stale / Idle Timeout Check (No packets in 60 seconds)
+					if (nowNs - stats.LastTimeNs) > timeoutNs {
+						shouldEvict = true
+					}
+
+					// Tag for deletion
+					if shouldEvict {
+						flowsToEvict = append(flowsToEvict, key)
+					}
+				}
+
+				if err := iterator.Err(); err != nil {
 					log.Printf("Error iterating ActiveFlows map: %v", err)
 				}
 
