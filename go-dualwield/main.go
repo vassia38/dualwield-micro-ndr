@@ -527,7 +527,9 @@ func main() {
 
 				iterator := objs.ActiveFlows.Iterate()
 				flowsFound := false
-				activeCount := 0 // flows present in the table at this poll (Chapter 6.4 saturation)
+				activeCount := 0         // flows present in the table at this poll (Chapter 6.4 saturation)
+				batchStart := time.Now() // poll-batch wall time (Chapter 6.5)
+				var mlNanos int64        // cumulative pure ML inference time this batch
 
 				for iterator.Next(&key, &stats) {
 					activeCount++
@@ -578,7 +580,9 @@ func main() {
 
 					// ========== TWO-STAGE ANALYSIS PIPELINE ==========
 					// STAGE 1: Binary Classifier (Benign vs Malicious)
+					mlT0 := time.Now()
 					binaryScores := binaryScore(features)
+					mlNanos += time.Since(mlT0).Nanoseconds()
 					binaryPrediction, binaryConfidence := predictAndConfidence(binaryScores)
 
 					// default eviction flag
@@ -598,7 +602,9 @@ func main() {
 							binaryConfidence)
 
 						// STAGE 2: Multi-Class Classifier
+						mlT1 := time.Now()
 						multiclassScores := multiclassScore(features)
+						mlNanos += time.Since(mlT1).Nanoseconds()
 						multiclassPrediction, multiclassConfidence := predictAndConfidence(multiclassScores)
 
 						attackName, known := attackMap[multiclassPrediction]
@@ -682,6 +688,8 @@ func main() {
 					log.Printf("[FLOW-TABLE] active=%d/%d (%.1f%% full)",
 						activeCount, maxEntries,
 						100*float64(activeCount)/float64(maxEntries))
+					log.Printf("[TIMING] batch=%v ml_total=%.2fms flows=%d (Chapter 6.5)",
+						time.Since(batchStart), float64(mlNanos)/1e6, activeCount)
 				}
 
 				if len(flowsToEvict) > 0 {
