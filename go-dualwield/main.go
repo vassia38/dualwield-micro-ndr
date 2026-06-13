@@ -425,6 +425,14 @@ func main() {
 	// the attack-to-block latency in Chapter 6.5 (default log resolution is 1s).
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
+	// DETECT_ONLY=1 observă și jurnalizează fluxurile, dar nu inserează nimic în
+	// drop map și nu sincronizează banlist-ul. Folosit pentru măsurătoarea de
+	// overhead din capitolul 6.4: traficul de test nu mai este blocat la mijloc.
+	detectOnly := os.Getenv("DETECT_ONLY") != ""
+	if detectOnly {
+		log.Println("DETECT_ONLY active: detection and logging only, no blocking")
+	}
+
 	// 1. Load the compiled eBPF objects into the kernel
 	objs := bpfObjects{}
 	if err := loadBpfObjects(&objs, nil); err != nil {
@@ -502,7 +510,9 @@ func main() {
 
 	// 3. Start Banlist Monitor and setup polling for ML features
 
-	go monitorBanlist(banlistPath, objs.DropFlowsMap, 5*time.Second)
+	if !detectOnly {
+		go monitorBanlist(banlistPath, objs.DropFlowsMap, 5*time.Second)
+	}
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -644,7 +654,9 @@ func main() {
 								log.Printf("   -> [QUARANTINE] applying flow block: %s", canonicalKeyString(banKey))
 							}
 
-							if err := objs.DropFlowsMap.Put(&banKey, &dummyValue); err != nil {
+							if detectOnly {
+								persistAlert(banKey, attackName)
+							} else if err := objs.DropFlowsMap.Put(&banKey, &dummyValue); err != nil {
 								log.Printf("   -> [ERROR] Failed to push quarantine to kernel: %v", err)
 							} else {
 								// Persist to banlist if this is an auto-ban class
