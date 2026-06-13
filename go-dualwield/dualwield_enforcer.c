@@ -85,10 +85,13 @@ struct flow_stats {
 };
 
 // =================================
-// eBPF MAP DEFINITIONS (LEGACY SYNTAX)
+// eBPF MAP DEFINITIONS
 // =================================
-// we use SEC("maps") instead of SEC(".maps") to avoid the "failed to find
-// valid kernel BTF" error on constrained OpenWRT builds
+// SEC(".maps") does NOT require kernel BTF at load time. Type information
+// is embedded by clang in the ELF at compile time (ELF BTF), independently
+// of /sys/kernel/btf/vmlinux. The "failed to find valid kernel BTF" error
+// is caused by CO-RE relocations and vmlinux.h usage, not by map declarations.
+// The typedefs above replace vmlinux.h, eliminating all CO-RE dependencies.
 
 /*
 // map to keep track of active flow

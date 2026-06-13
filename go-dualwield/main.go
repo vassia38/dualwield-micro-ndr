@@ -421,6 +421,10 @@ var attackMap = map[int]string{
 }
 
 func main() {
+	// Microsecond-resolution timestamps on every log line, used to measure
+	// the attack-to-block latency in Chapter 6.5 (default log resolution is 1s).
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
 	// 1. Load the compiled eBPF objects into the kernel
 	objs := bpfObjects{}
 	if err := loadBpfObjects(&objs, nil); err != nil {
@@ -523,8 +527,10 @@ func main() {
 
 				iterator := objs.ActiveFlows.Iterate()
 				flowsFound := false
+				activeCount := 0 // flows present in the table at this poll (Chapter 6.4 saturation)
 
 				for iterator.Next(&key, &stats) {
+					activeCount++
 					if !flowsFound {
 						fmt.Println("--- NEW ML BATCH ---")
 						flowsFound = true
@@ -669,7 +675,21 @@ func main() {
 					log.Printf("Error iterating ActiveFlows map: %v", err)
 				}
 
+				// Flow-table occupancy snapshot (Chapter 6.4): how close the
+				// 4096-entry active_flows map is to saturation under load.
+				if flowsFound {
+					maxEntries := objs.ActiveFlows.MaxEntries()
+					log.Printf("[FLOW-TABLE] active=%d/%d (%.1f%% full)",
+						activeCount, maxEntries,
+						100*float64(activeCount)/float64(maxEntries))
+				}
+
 				if len(flowsToEvict) > 0 {
+					for _, k := range flowsToEvict {
+						if err := objs.ActiveFlows.Delete(&k); err != nil {
+							log.Printf("[HOUSEKEEPING] Failed to delete flow %s: %v", canonicalKeyString(k), err)
+						}
+					}
 					log.Printf("[HOUSEKEEPING] Evicted %d closed/stale flows from kernel memory", len(flowsToEvict))
 				}
 			}
