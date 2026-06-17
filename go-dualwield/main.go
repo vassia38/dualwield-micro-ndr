@@ -640,16 +640,14 @@ func main() {
 							// Apply quarantine (5-tuple or IP wildcard block for DDoS)
 							dummyValue := uint32(1)
 
-							// If this is a DDoS class, insert an IP wildcard ban to block the attacker IP
-							// regardless of the destination port. The eBPF program treats port==0 as
-							// a wildcard port and ip==0 as a wildcard IP in the lookup logic.
+							// If this is a DDoS class, insert port wildcards
 							banKey := key
 							if multiclassPrediction == 1 { // DDoS
-								banKey.IpA = 0
+								banKey.IpA = serverIP
 								banKey.IpB = clientIP
 								banKey.PortA = 0
 								banKey.PortB = 0
-								log.Printf("   -> [QUARANTINE-IP] applying attacker-IP wildcard block: %s", canonicalKeyString(banKey))
+								log.Printf("   -> [QUARANTINE-IP] applying ports wildcard block: %s", canonicalKeyString(banKey))
 							} else {
 								log.Printf("   -> [QUARANTINE] applying flow block: %s", canonicalKeyString(banKey))
 							}
