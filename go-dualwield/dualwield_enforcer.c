@@ -28,40 +28,10 @@ typedef __u32 __wsum;
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <stdbool.h>
-/*
-#include "vmlinux.h"
-#include <bpf/bpf_endian.h>
-#include <bpf/bpf_helpers.h>
 
-#ifndef ETH_P_IP
-#define ETH_P_IP 0x0800
-#endif
-
-#ifndef TC_ACT_OK
-#define TC_ACT_OK 0
-#endif
-
-#ifndef TC_ACT_SHOT
-#define TC_ACT_SHOT 2
-#endif
-
-#ifndef TC_ACT_UNSPEC
-#define TC_ACT_UNSPEC -1
-#endif
-*/
 // =================================
 // Data Structures
 // =================================
-
-/*
-struct bpf_map_def {
-  unsigned int type;
-  unsigned int key_size;
-  unsigned int value_size;
-  unsigned int max_entries;
-  unsigned int map_flags;
-};
-*/
 
 // define 5-tuple flow-key
 struct flow_key {
@@ -72,7 +42,7 @@ struct flow_key {
   __u8 protocol;
 };
 
-// define flow statistics; vmlinux.h brings it over
+// flow statistics (defined manually here; no vmlinux.h / CO-RE)
 struct flow_stats {
   __u64 pkts_a_to_b;
   __u64 bytes_a_to_b;
@@ -93,34 +63,6 @@ struct flow_stats {
 // is caused by CO-RE relocations and vmlinux.h usage, not by map declarations.
 // The typedefs above replace vmlinux.h, eliminating all CO-RE dependencies.
 
-/*
-// map to keep track of active flow
-struct bpf_map_def SEC("maps") active_flows = {
-    .type = BPF_MAP_TYPE_HASH,
-    .max_entries = 4096, // reasonable for 128/256MB RAM
-    .key_size = sizeof(struct flow_key),
-    .value_size = sizeof(struct flow_stats),
-};
-
-// Perf Event Array to send data to userspace
-struct bpf_map_def SEC("maps") flow_export_events = {
-    .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
-    .key_size = sizeof(__u32),
-    .value_size = sizeof(__u32),
-    .max_entries = 0, // dynamically sized by the loader per-CPU
-};
-
-// Define the dummy firewall map
-// Key: IPv4 address (32-bit integer)
-// Value: A dummy flag/counter (32-bit integer)
-struct bpf_map_def SEC("maps") drop_ips_map = {
-    .type = BPF_MAP_TYPE_HASH,
-    .max_entries = 1024,
-    .key_size = sizeof(struct flow_key),
-    .value_size = sizeof(struct flow_stats),
-};
-*/
-
 // map to keep track of active flow
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -128,15 +70,6 @@ struct {
   __type(key, struct flow_key);
   __type(value, struct flow_stats);
 } active_flows SEC(".maps");
-
-// Perf Event Array to send data to userspace
-/*
-struct {
-  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-  __uint(key_size, sizeof(__u32));
-  __uint(value_size, sizeof(__u32));
-} flow_export_events SEC(".maps");
-*/
 
 // Define the dummy firewall map
 // Key: IPv4 address (32-bit integer)
@@ -187,9 +120,32 @@ struct {
   __uint(map_flags, BPF_F_NO_PREALLOC);
 } blocklist_v4 SEC(".maps");
 
-// Helper: create a canonical flow_key from two IPs and ports.
-static __inline void make_canonical(__u32 ip1, __u32 ip2, __u16 p1, __u16 p2, __u8 proto, struct flow_key *out) {
-  if ((ip1 < ip2) || (ip1 == ip2 && p1 <= p2)) {
+// Drop counters for observability: index 0 = reputation blocklist, 1 = ML/banlist
+// quarantine. PERCPU so the increment is lock-free on the datapath; userspace sums
+// across CPUs. Lets Chapter 6 quantify how much traffic each layer actually dropped.
+#define DROP_STAT_REPUTATION 0
+#define DROP_STAT_QUARANTINE 1
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 2);
+  __type(key, __u32);
+  __type(value, __u64);
+} drop_stats SEC(".maps");
+
+static __inline void count_drop(__u32 idx) {
+  __u64 *c = bpf_map_lookup_elem(&drop_stats, &idx);
+  if (c)
+    (*c)++;
+}
+
+// Helper: create a canonical flow_key from two IPs and ports. This is the SINGLE
+// source of the ordering rule; the packet path calls it instead of inlining its
+// own copy, and the Go loader mirrors it in makeCanonicalKey. Comparison is on the
+// raw network-order values (ports as read from the header / produced by htons).
+// Returns true if (ip1,p1) became endpoint a, so the caller can tell direction.
+static __inline bool make_canonical(__u32 ip1, __u32 ip2, __u16 p1, __u16 p2, __u8 proto, struct flow_key *out) {
+  bool first_is_a = (ip1 < ip2) || (ip1 == ip2 && p1 <= p2);
+  if (first_is_a) {
     out->ip_a = ip1;
     out->ip_b = ip2;
     out->port_a = p1;
@@ -201,6 +157,7 @@ static __inline void make_canonical(__u32 ip1, __u32 ip2, __u16 p1, __u16 p2, __
     out->port_b = p1;
   }
   out->protocol = proto;
+  return first_is_a;
 }
 
 // =================================
@@ -220,13 +177,34 @@ int dualwield_enforcer(struct __sk_buff *skb) {
   // Bounds checking is strictly required by the eBPF verifier
   if ((void *)(eth + 1) > data_end)
     return TC_ACT_OK;
-  // Allow non-IPv4 traffic to pass through
-  if (eth->h_proto != bpf_htons(ETH_P_IP))
+
+  __u16 h_proto = eth->h_proto;
+  void *l3 = (void *)(eth + 1);
+
+  // Unwrap a single 802.1Q / 802.1ad VLAN tag if present, so tagged IPv4 traffic
+  // is still inspected and enforceable rather than passing through unseen.
+  // (QinQ double-tagging is rare and left unhandled.)
+  if (h_proto == bpf_htons(ETH_P_8021Q) || h_proto == bpf_htons(ETH_P_8021AD)) {
+    struct vlan_hdr {
+      __be16 h_vlan_TCI;
+      __be16 h_vlan_encapsulated_proto;
+    };
+    struct vlan_hdr *vhdr = l3;
+    if ((void *)(vhdr + 1) > data_end)
+      return TC_ACT_OK;
+    h_proto = vhdr->h_vlan_encapsulated_proto;
+    l3 = (void *)(vhdr + 1);
+  }
+
+  // Allow non-IPv4 traffic to pass through. IPv6 is intentionally out of scope:
+  // it is passed unfiltered (a documented limitation - the flow model, maps and
+  // ML features are all IPv4). On a dual-stack link this is a blind spot.
+  if (h_proto != bpf_htons(ETH_P_IP))
     return TC_ACT_OK;
 
   // --- Parse IPv4 ---
 
-  struct iphdr *ip = (void *)(eth + 1);
+  struct iphdr *ip = l3;
   // Bounds checking for the IP header
   if ((void *)(ip + 1) > data_end)
     return TC_ACT_OK;
@@ -261,11 +239,15 @@ int dualwield_enforcer(struct __sk_buff *skb) {
   // priority, so a trusted address is never dropped here. Reuses akey (prefixlen
   // is still 32 from the allowlist lookups).
   akey.addr = src_ip;
-  if (bpf_map_lookup_elem(&blocklist_v4, &akey))
+  if (bpf_map_lookup_elem(&blocklist_v4, &akey)) {
+    count_drop(DROP_STAT_REPUTATION);
     return TC_ACT_SHOT;
+  }
   akey.addr = dst_ip;
-  if (bpf_map_lookup_elem(&blocklist_v4, &akey))
+  if (bpf_map_lookup_elem(&blocklist_v4, &akey)) {
+    count_drop(DROP_STAT_REPUTATION);
     return TC_ACT_SHOT;
+  }
 
   // --- Flow tracking ---
   //
@@ -278,12 +260,17 @@ int dualwield_enforcer(struct __sk_buff *skb) {
   if (ip_hdr_len < sizeof(struct iphdr))
     return TC_ACT_OK;
 
+  // Non-initial IP fragments carry no L4 header: reading the L4 offset would
+  // interpret payload bytes as ports. Only the first fragment (offset 0) has the
+  // ports; later fragments are tracked by IP+protocol with ports left at 0.
+  bool has_l4 = (bpf_ntohs(ip->frag_off) & 0x1FFF) == 0;
+
   __u16 src_port = 0;
   __u16 dst_port = 0;
   __u8 flags = 0;
 
   // parse TCP ports
-  if (ip->protocol == IPPROTO_TCP) {
+  if (has_l4 && ip->protocol == IPPROTO_TCP) {
     struct tcphdr *tcp = (void *)((__u8 *)ip + ip_hdr_len);
     // strictly check the TCP header is within packet bounds
     if ((void *)(tcp + 1) <= data_end) {
@@ -293,7 +280,7 @@ int dualwield_enforcer(struct __sk_buff *skb) {
     }
   }
   // parse UDP ports
-  else if (ip->protocol == IPPROTO_UDP) {
+  else if (has_l4 && ip->protocol == IPPROTO_UDP) {
     struct udphdr *udp = (void *)((__u8 *)ip + ip_hdr_len);
     // strictly check bounds for udphdr
     if ((void *)(udp + 1) <= data_end) {
@@ -302,51 +289,53 @@ int dualwield_enforcer(struct __sk_buff *skb) {
     }
   }
 
+  // Build the canonical key via the shared helper (the Go loader mirrors the same
+  // ordering), and learn the direction for the per-direction counters below.
   struct flow_key fkey = {};
-  fkey.protocol = ip->protocol;
-
-  bool is_a_to_b =
-      (src_ip < dst_ip) || (src_ip == dst_ip && src_port < dst_port);
-  if (is_a_to_b) {
-    fkey.ip_a = src_ip;
-    fkey.ip_b = dst_ip;
-    fkey.port_a = src_port;
-    fkey.port_b = dst_port;
-  } else {
-    fkey.ip_a = dst_ip;
-    fkey.ip_b = src_ip;
-    fkey.port_a = dst_port;
-    fkey.port_b = src_port;
-  }
+  bool is_a_to_b = make_canonical(src_ip, dst_ip, src_port, dst_port, ip->protocol, &fkey);
 
   // --- Quarantine check ---
 
-  // Try several map lookup patterns to support wildcards (port==0 => any port,
-  // ip==0 => any IP). We canonicalize keys the same way as when inserting bans.
+  // The drop map supports three ban granularities, each a key built with the same
+  // canonicalization as on insert. None of these are dead: patterns (1)/(2) are
+  // produced by the ML quarantine path (exact 5-tuple, and port-wildcard IP-pair
+  // for DDoS), and pattern (3) is produced by IP-wildcard banlist entries such as
+  // "6,1.2.3.4,*,0.0.0.0,*" and by the (planned) role-aware quarantine of a
+  // compromised host. Cost note for Chapter 6.4: this is up to four drop-map
+  // lookups per packet on top of the two allowlist and two blocklist lookups.
   struct flow_key try = {};
   __u32 *is_blocked = NULL;
 
-  // 1) exact match
+  // 1) exact 5-tuple match
   is_blocked = bpf_map_lookup_elem(&drop_flows_map, &fkey);
-  if (is_blocked)
+  if (is_blocked) {
+    count_drop(DROP_STAT_QUARANTINE);
     return TC_ACT_SHOT;
+  }
 
   // 2) wildcard ports between the same IP pair (port_a=0, port_b=0)
   make_canonical(fkey.ip_a, fkey.ip_b, 0, 0, fkey.protocol, &try);
   is_blocked = bpf_map_lookup_elem(&drop_flows_map, &try);
-  if (is_blocked)
+  if (is_blocked) {
+    count_drop(DROP_STAT_QUARANTINE);
     return TC_ACT_SHOT;
+  }
 
-  // 3) IP wildcard: attacker IP to any destination. Try both src and dst as attacker.
+  // 3) IP wildcard: one address to/from anywhere (the other ip and both ports 0).
+  // Try both src and dst as the banned address.
   make_canonical(src_ip, 0, 0, 0, fkey.protocol, &try);
   is_blocked = bpf_map_lookup_elem(&drop_flows_map, &try);
-  if (is_blocked)
+  if (is_blocked) {
+    count_drop(DROP_STAT_QUARANTINE);
     return TC_ACT_SHOT;
+  }
 
   make_canonical(dst_ip, 0, 0, 0, fkey.protocol, &try);
   is_blocked = bpf_map_lookup_elem(&drop_flows_map, &try);
-  if (is_blocked)
+  if (is_blocked) {
+    count_drop(DROP_STAT_QUARANTINE);
     return TC_ACT_SHOT;
+  }
 
   // Update the flow statistics
   __u64 now = bpf_ktime_get_ns();

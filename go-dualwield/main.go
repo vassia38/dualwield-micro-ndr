@@ -1,15 +1,11 @@
 package main
 
 import (
-	//"bytes"
 	"bufio"
 	"encoding/binary"
-
-	//"errors"
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -17,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"go-dualwield/predictconfidence"
 
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
@@ -70,6 +68,25 @@ func ntohs(port uint16) uint16 {
 
 func htons(port uint16) uint16 {
 	return ntohs(port)
+}
+
+// makeCanonicalKey orders a flow's two endpoints exactly as the eBPF make_canonical
+// helper does, so a key built here matches the key the kernel computes from a
+// packet. Inputs are raw network-order: ipA/ipB as produced by ipToUint32 and
+// portNetA/portNetB as produced by htons. Comparing host-order ports here was a
+// bug that mis-ordered keys whenever the two endpoints shared an IP, so a hand
+// written banlist entry could canonicalize to a key the kernel never produces.
+func makeCanonicalKey(protocol uint8, ipA, ipB uint32, portNetA, portNetB uint16) flowKey {
+	var k flowKey
+	k.Protocol = protocol
+	if ipA < ipB || (ipA == ipB && portNetA <= portNetB) {
+		k.IpA, k.IpB = ipA, ipB
+		k.PortA, k.PortB = portNetA, portNetB
+	} else {
+		k.IpA, k.IpB = ipB, ipA
+		k.PortA, k.PortB = portNetB, portNetA
+	}
+	return k
 }
 
 // ipToUint32 converts a string IPv4 address into the raw 4-byte layout used by the eBPF key.
@@ -169,38 +186,37 @@ func canonicalKeyString(k flowKey) string {
 		dstPort)
 }
 
-func flowKeyToBanlistLine(k flowKey) string {
-	srcPort := "*"
-	dstPort := "*"
-	if k.PortA != 0 {
-		srcPort = strconv.FormatUint(uint64(ntohs(k.PortA)), 10)
-	}
-	if k.PortB != 0 {
-		dstPort = strconv.FormatUint(uint64(ntohs(k.PortB)), 10)
-	}
-	return fmt.Sprintf("%d,%s,%s,%s,%s",
-		k.Protocol,
-		intToIP(k.IpA).String(),
-		srcPort,
-		intToIP(k.IpB).String(),
-		dstPort)
-}
+// lineCache holds, per file path, the set of lines already present so
+// appendUniqueLine costs O(1) per call instead of re-reading the whole file each
+// time. The set is lazy-loaded from the file on first use (so duplicates across
+// reboots are still caught). Accessed only from the polling goroutine.
+var lineCache = map[string]map[string]struct{}{}
 
+// appendUniqueLine appends line to path unless already present. Used for the
+// banlist, whose entries carry no timestamp and must not be duplicated across
+// flows or reboots. (The timestamped logs use appendLine, which never dedups.)
 func appendUniqueLine(path, line string) error {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return nil
 	}
 
-	content, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
-	for _, existing := range strings.Split(string(content), "\n") {
-		if strings.TrimSpace(existing) == line {
-			return nil
+	seen := lineCache[path]
+	if seen == nil {
+		seen = make(map[string]struct{})
+		content, err := os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
+			return err
 		}
+		for _, existing := range strings.Split(string(content), "\n") {
+			if existing = strings.TrimSpace(existing); existing != "" {
+				seen[existing] = struct{}{}
+			}
+		}
+		lineCache[path] = seen
+	}
+	if _, ok := seen[line]; ok {
+		return nil
 	}
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -212,7 +228,40 @@ func appendUniqueLine(path, line string) error {
 	if _, err := f.WriteString(line + "\n"); err != nil {
 		return err
 	}
+	seen[line] = struct{}{}
 	return nil
+}
+
+// rotateIfLarge renames path to path+".1" (replacing any previous .1) once it
+// grows past maxBytes, capping disk use at ~2x maxBytes per log - important on a
+// device with 128MB flash / a USB stick where an unbounded log can fill the disk.
+func rotateIfLarge(path string, maxBytes int64) {
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() < maxBytes {
+		return
+	}
+	if err := os.Rename(path, path+".1"); err != nil {
+		log.Printf("Failed to rotate %s: %v", path, err)
+	}
+}
+
+// appendLine appends a line to an append-only log, rotating first if it is too
+// large. No content dedup: the timestamped alert/SOC logs are already
+// deduplicated per flow in memory (alertedFlows / socReviewedFlows), and their
+// timestamps make every line unique anyway.
+func appendLine(path, line string) error {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return nil
+	}
+	rotateIfLarge(path, *maxLogBytes)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(line + "\n")
+	return err
 }
 
 // persistAlert appends one alert per flow lifetime. dedupKey is the active
@@ -225,7 +274,7 @@ func persistAlert(dedupKey, logKey flowKey, attackName string) {
 	}
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 	line := fmt.Sprintf("%s,%s,%s", timestamp, attackName, canonicalKeyString(logKey))
-	if err := appendUniqueLine(alertsPath, line); err != nil {
+	if err := appendLine(alertsPath, line); err != nil {
 		log.Printf("Failed to persist alert: %v", err)
 		return
 	}
@@ -249,7 +298,7 @@ func persistSocReview(k flowKey, binaryConf float64, multiclassClass int, multic
 		className,
 		multiclassConf,
 		reason)
-	if err := appendUniqueLine(socReviewPath, line); err != nil {
+	if err := appendLine(socReviewPath, line); err != nil {
 		log.Printf("Failed to persist SOC review entry: %v", err)
 		return
 	}
@@ -257,82 +306,10 @@ func persistSocReview(k flowKey, binaryConf float64, multiclassClass int, multic
 }
 
 func persistBanlistEntry(k flowKey) {
-	line := flowKeyToBanlistLine(k)
+	line := canonicalKeyString(k)
 	if err := appendUniqueLine(banlistPath, line); err != nil {
 		log.Printf("Failed to persist banlist entry: %v", err)
 	}
-}
-
-// returns (predictedClass, confidencePickingPredictedClass)
-func predictAndConfidence(scores []float64) (int, float64) {
-	n := len(scores)
-	if n == 0 {
-		return 0, 0.0
-	}
-
-	// check if scores already sum to ~1
-	var sum float64
-	for _, v := range scores {
-		sum += v
-	}
-	const eps = 1e-6
-
-	var probs []float64
-	if math.Abs(sum-1.0) < eps && sum > 0 {
-		// likely already probabilities
-		probs = make([]float64, n)
-		copy(probs, scores)
-	} else {
-		// if all non-negative, normalize by sum (vote-count style)
-		allNonNeg := true
-		for _, v := range scores {
-			if v < 0 {
-				allNonNeg = false
-				break
-			}
-		}
-		if allNonNeg && sum > 0 {
-			probs = make([]float64, n)
-			for i, v := range scores {
-				probs[i] = v / sum
-			}
-		} else {
-			// fallback: softmax for arbitrary real-valued scores
-			max := scores[0]
-			for _, v := range scores {
-				if v > max {
-					max = v
-				}
-			}
-			exps := make([]float64, n)
-			var expSum float64
-			for i, v := range scores {
-				e := math.Exp(v - max)
-				exps[i] = e
-				expSum += e
-			}
-			probs = make([]float64, n)
-			for i := range exps {
-				probs[i] = exps[i] / expSum
-			}
-		}
-	}
-
-	// argmax + confidence
-	bestIdx := 0
-	bestVal := probs[0]
-	secondBest := 0.0
-	for i, p := range probs {
-		if p > bestVal {
-			secondBest = bestVal
-			bestVal = p
-			bestIdx = i
-		} else if p > secondBest && i != bestIdx {
-			secondBest = p
-		}
-	}
-	// optional margin = bestVal - secondBest
-	return bestIdx, bestVal
 }
 
 // read a text file and syncs it with the eBPF drop map.
@@ -380,22 +357,9 @@ func monitorBanlist(filepath string, dropMap *ebpf.Map, interval time.Duration) 
 				continue
 			}
 
-			portNet_a := htons(port_a_u16)
-			portNet_b := htons(port_b_u16)
+			fkey := makeCanonicalKey(uint8(protocol), ip_a, ip_b, htons(port_a_u16), htons(port_b_u16))
 
-			var fkey flowKey
-			fkey.Protocol = uint8(protocol)
-
-			isAToB := (ip_a < ip_b) || (ip_a == ip_b && uint32(port_a_u16) < uint32(port_b_u16))
-			if isAToB {
-				fkey.IpA, fkey.IpB = ip_a, ip_b
-				fkey.PortA, fkey.PortB = portNet_a, portNet_b
-			} else {
-				fkey.IpA, fkey.IpB = ip_b, ip_a
-				fkey.PortA, fkey.PortB = portNet_b, portNet_a
-			}
-
-			if isAllowlisted(fkey.IpA) || isAllowlisted(fkey.IpB) {
+			if banTouchesTrusted(fkey) {
 				log.Printf("[ALLOWLIST] refusing banlist entry targeting a trusted address: %s", canonicalKeyString(fkey))
 				continue
 			}
@@ -519,17 +483,48 @@ func monitorBlocklist(filepath string, blockMap *ebpf.Map, interval time.Duratio
 	}
 }
 
-func getPrediction(scores []float64) int {
-	bestClass := 0
-	highestScore := scores[0]
+// drop_stats indices, mirroring the #defines in the eBPF program.
+const (
+	dropStatReputation = 0
+	dropStatQuarantine = 1
+)
 
-	for classIndex, score := range scores {
-		if score > highestScore {
-			highestScore = score
-			bestClass = classIndex
+// sumPerCPU reads one entry of a PERCPU_ARRAY (one value per CPU) and returns the
+// sum across all CPUs.
+func sumPerCPU(m *ebpf.Map, key uint32) (uint64, error) {
+	var perCPU []uint64
+	if err := m.Lookup(&key, &perCPU); err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, v := range perCPU {
+		total += v
+	}
+	return total, nil
+}
+
+// monitorDropStats periodically logs the cumulative packet counts dropped by the
+// reputation blocklist and by the ML/banlist quarantine, but only when they
+// change, so Chapter 6 can quantify each layer's contribution without log spam.
+func monitorDropStats(statsMap *ebpf.Map, interval time.Duration) {
+	if statsMap == nil {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var lastRep, lastQuar uint64
+	for range ticker.C {
+		rep, err1 := sumPerCPU(statsMap, dropStatReputation)
+		quar, err2 := sumPerCPU(statsMap, dropStatQuarantine)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		if rep != lastRep || quar != lastQuar {
+			log.Printf("[DROP-STATS] reputation=%d quarantine=%d (cumulative packets dropped)", rep, quar)
+			lastRep, lastQuar = rep, quar
 		}
 	}
-	return bestClass
 }
 
 var attackMap = map[int]string{
@@ -615,11 +610,33 @@ func resolvConfNameservers(path string) []net.IP {
 	return out
 }
 
-// gatherSeedCIDRs auto-detects infrastructure that must never be scored or
-// blocked: loopback, the router's own addresses on the attached interfaces, the
-// default gateway(s), and the configured DNS resolvers. Note: the LAN subnet is
-// deliberately NOT seeded - whitelisting it would skip scoring all client
-// traffic, which is exactly what we want to protect.
+// subnetBroadcast returns the directed broadcast address of an IPv4 network
+// (host bits all ones), or nil if n is not IPv4.
+func subnetBroadcast(n *net.IPNet) net.IP {
+	if n == nil {
+		return nil
+	}
+	ip4 := n.IP.To4()
+	mask := n.Mask
+	if ip4 == nil || len(mask) != 4 {
+		return nil
+	}
+	bc := make(net.IP, 4)
+	for i := 0; i < 4; i++ {
+		bc[i] = ip4[i] | ^mask[i]
+	}
+	return bc
+}
+
+// gatherSeedCIDRs auto-detects addresses that must never be scored or blocked:
+// loopback; the local-scope destinations that never leave the LAN (all IPv4
+// multicast, limited broadcast, link-local, unspecified); the router's own
+// addresses and each subnet's directed broadcast; the default gateway(s); and the
+// configured DNS resolvers. Note: the LAN *unicast* subnet is deliberately NOT
+// seeded - whitelisting it would skip scoring all client traffic, which is exactly
+// what we want to protect. Multicast/broadcast are group traffic, not unicast
+// flows, so exempting them removes a whole class of false positives (SSDP, mDNS,
+// LLMNR, NetBIOS, DHCP) without weakening unicast detection.
 func gatherSeedCIDRs(ifaces []string) []*net.IPNet {
 	var nets []*net.IPNet
 	add := func(n *net.IPNet, what string) {
@@ -629,8 +646,17 @@ func gatherSeedCIDRs(ifaces []string) []*net.IPNet {
 		}
 	}
 
-	if _, n, err := net.ParseCIDR("127.0.0.0/8"); err == nil {
-		add(n, "loopback")
+	// Local-scope ranges (RFC-defined, identical on every network).
+	for _, cidr := range []string{
+		"127.0.0.0/8",        // loopback
+		"224.0.0.0/4",        // all IPv4 multicast (SSDP, mDNS, LLMNR, IGMP, ...)
+		"255.255.255.255/32", // limited broadcast
+		"169.254.0.0/16",     // link-local / APIPA
+		"0.0.0.0/32",         // unspecified (e.g. DHCP DISCOVER source)
+	} {
+		if _, n, err := net.ParseCIDR(cidr); err == nil {
+			add(n, "local-scope")
+		}
 	}
 
 	for _, iface := range ifaces {
@@ -643,10 +669,16 @@ func gatherSeedCIDRs(ifaces []string) []*net.IPNet {
 			continue
 		}
 		for _, a := range addrs {
-			if a.IP.To4() == nil {
+			ip4 := a.IP.To4()
+			if ip4 == nil {
 				continue
 			}
-			add(&net.IPNet{IP: a.IP.To4(), Mask: net.CIDRMask(32, 32)}, "router-ip("+iface+")")
+			add(&net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}, "router-ip("+iface+")")
+			// Directed broadcast for this subnet (e.g. 192.168.1.255), used by
+			// NetBIOS/DHCP and otherwise misread as a unicast flow.
+			if bc := subnetBroadcast(a.IPNet); bc != nil && !bc.Equal(ip4) {
+				add(&net.IPNet{IP: bc, Mask: net.CIDRMask(32, 32)}, "broadcast("+iface+")")
+			}
 		}
 	}
 
@@ -722,12 +754,80 @@ func isAllowlisted(ipRaw uint32) bool {
 	return false
 }
 
+// banTouchesTrusted reports whether a ban key would hit a trusted address. An IP
+// of 0 in a key is a wildcard ("any"), not the literal 0.0.0.0, so it is skipped
+// - otherwise the seeded 0.0.0.0 allowlist entry would reject every IP-wildcard
+// ban (e.g. a compromised-host quarantine, whose other endpoint is 0).
+func banTouchesTrusted(k flowKey) bool {
+	return (k.IpA != 0 && isAllowlisted(k.IpA)) || (k.IpB != 0 && isAllowlisted(k.IpB))
+}
+
+// lanNets are the internal/trusted-side networks (1.3). A malicious flow whose
+// initiator falls inside one of these is treated as a compromised internal host
+// and quarantined host-wide; an external initiator gets only a scoped ban.
+var lanNets []*net.IPNet
+
+// loadLanNets builds lanNets from the -lan-cidr flag plus the subnets of the
+// attached interfaces. Called once at startup before the polling goroutine reads
+// lanNets.
+func loadLanNets(ifaces []string) {
+	var nets []*net.IPNet
+	for _, p := range strings.Split(*lanCIDRFlag, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			if n, err := parseCIDROrIP(p); err == nil {
+				nets = append(nets, n)
+			} else {
+				log.Printf("[LAN] skipping invalid -lan-cidr %q: %v", p, err)
+			}
+		}
+	}
+	for _, iface := range ifaces {
+		link, err := netlink.LinkByName(iface)
+		if err != nil {
+			continue
+		}
+		addrs, err := netlink.AddrList(link, unix.AF_INET)
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ip4 := a.IP.To4()
+			if ip4 == nil || a.Mask == nil {
+				continue
+			}
+			nets = append(nets, &net.IPNet{IP: ip4.Mask(a.Mask), Mask: a.Mask})
+		}
+	}
+	lanNets = nets
+	for _, n := range nets {
+		log.Printf("[LAN] internal network: %s", n.String())
+	}
+}
+
+// isInternal reports whether a raw (network-order) IPv4 address is in an internal
+// (LAN) network.
+func isInternal(ipRaw uint32) bool {
+	ip := intToIP(ipRaw)
+	for _, n := range lanNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // ifacesFlag is the comma-separated list of interfaces the sensor attaches to.
 // Default is the LAN bridge alone: on a NAT router this is the only place where
 // both directions of a routed flow carry the same (LAN-side) address. See
 // attachInterface for why ingress on a second interface would not merge them.
 var ifacesFlag = flag.String("ifaces", "br-lan",
 	"comma-separated interfaces to attach to (ingress+egress on each)")
+
+// lanCIDRFlag (1.3) lists internal/LAN CIDRs. Empty = auto-derive from the
+// attached interfaces' subnets. Internal hosts that turn malicious are
+// quarantined host-wide; external attackers get scoped bans only.
+var lanCIDRFlag = flag.String("lan-cidr", "",
+	"comma-separated internal/LAN CIDRs (default: auto from attached interfaces)")
 
 // minConfidence (2.1) is the Stage-2 confidence floor for ENFORCEMENT. Below it
 // a malicious verdict is still alerted but not blocked. minPackets (2.2) is the
@@ -744,6 +844,11 @@ var minPackets = flag.Uint("min-packets", 8,
 // see fetch_threat_intel.sh), keeping the agent free of any network dependency.
 var blocklistRefresh = flag.Duration("blocklist-refresh", 10*time.Minute,
 	"how often to re-sync the threat-intel blocklist file into the kernel")
+
+// maxLogBytes (6.2) caps each append-only log (alerts, soc_review); past it the
+// file is rotated to .1 so logs cannot fill the flash/USB on this constrained box.
+var maxLogBytes = flag.Int64("max-log-bytes", 5<<20,
+	"rotate alerts/soc_review logs once they exceed this many bytes")
 
 // resolveIfaces returns the interface list to attach to. The DW_IFACES env var
 // (comma separated) overrides the -ifaces flag so the agent can run unattended
@@ -885,6 +990,9 @@ func main() {
 	// active and we never want to alert on the gateway either.
 	loadAllowlist(objs.AllowlistV4, ifaces)
 
+	// Internal-network set for role-aware ban scope (1.3).
+	loadLanNets(ifaces)
+
 	// 3. Start Banlist Monitor and setup polling for ML features
 
 	if !detectOnly {
@@ -893,6 +1001,9 @@ func main() {
 		// overhead measurement never drops traffic.
 		go monitorBlocklist(threatIntelPath, objs.BlocklistV4, *blocklistRefresh)
 	}
+	// Drop-counter observability (3.1 follow-up): runs regardless of mode (it only
+	// reads counters; in DETECT_ONLY nothing is dropped so they stay at 0).
+	go monitorDropStats(objs.DropStats, 30*time.Second)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -986,7 +1097,7 @@ func main() {
 						mlT0 := time.Now()
 						binaryScores := binaryScore(features)
 						mlNanos += time.Since(mlT0).Nanoseconds()
-						binaryPrediction, binaryConfidence := predictAndConfidence(binaryScores)
+						binaryPrediction, binaryConfidence := predictconfidence.PredictAndConfidence(binaryScores)
 
 						if binaryPrediction == 0 {
 							// STAGE 1 -> Benign: No further analysis needed
@@ -1005,7 +1116,7 @@ func main() {
 							mlT1 := time.Now()
 							multiclassScores := multiclassScore(features)
 							mlNanos += time.Since(mlT1).Nanoseconds()
-							multiclassPrediction, multiclassConfidence := predictAndConfidence(multiclassScores)
+							multiclassPrediction, multiclassConfidence := predictconfidence.PredictAndConfidence(multiclassScores)
 
 							attackName, known := attackMap[multiclassPrediction]
 							if !known {
@@ -1027,16 +1138,30 @@ func main() {
 									intToIP(serverIP), ntohs(serverPort),
 									attackName, multiclassConfidence)
 
-								// Apply quarantine (5-tuple or IP wildcard block for DDoS)
 								dummyValue := uint32(1)
 
-								// If this is a DDoS class, insert port wildcards
-								banKey := key
-								if multiclassPrediction == 1 { // DDoS
-									banKey.IpA = serverIP
-									banKey.IpB = clientIP
-									banKey.PortA = 0
-									banKey.PortB = 0
+								// 1.3 role-aware ban scope. The initiator (clientIP) is the actor.
+								// - Internal (LAN) actor = a compromised host: quarantine it
+								//   host-wide (IP wildcard, attacker -> any). Cutting one LAN device
+								//   is acceptable and desirable.
+								// - External actor: scope the ban to this victim only - DDoS/DoS
+								//   gets a port-wildcard on the attacker<->victim pair, everything
+								//   else an exact 5-tuple. We NEVER place an IP wildcard on an
+								//   outside address (it may be shared infrastructure), and the
+								//   allowlist already protects the gateway/upstream. This is the
+								//   inversion that stops a WAN-side misclassification from cutting
+								//   the uplink.
+								// 1.4: a per-IP ban only addresses single-source DoS / scanning /
+								// a compromised host - NOT a distributed or spoofed-source flood
+								// (those sources never repeat, and spoofed ones never reach here).
+								var banKey flowKey
+								switch {
+								case isInternal(clientIP):
+									banKey = makeCanonicalKey(key.Protocol, clientIP, 0, 0, 0)
+								case multiclassPrediction == 1: // external DDoS/DoS: pair, all ports
+									banKey = makeCanonicalKey(key.Protocol, clientIP, serverIP, 0, 0)
+								default:
+									banKey = key // exact 5-tuple
 								}
 
 								// 2.1 + 2.2: the maturity gate and confidence floor gate
@@ -1047,7 +1172,7 @@ func main() {
 								confident := multiclassConfidence >= *minConfidence
 
 								switch {
-								case isAllowlisted(banKey.IpA) || isAllowlisted(banKey.IpB):
+								case banTouchesTrusted(banKey):
 									log.Printf("   -> [ALLOWLIST] refusing to quarantine flow touching a trusted address: %s", canonicalKeyString(banKey))
 								case !mature:
 									log.Printf("   -> [OBSERVING] %s: only %d pkts (< %d), not enforcing (alert only)",
@@ -1060,11 +1185,7 @@ func main() {
 								case detectOnly:
 									persistAlert(key, banKey, attackName)
 								default:
-									if multiclassPrediction == 1 {
-										log.Printf("   -> [QUARANTINE-IP] applying ports wildcard block: %s", canonicalKeyString(banKey))
-									} else {
-										log.Printf("   -> [QUARANTINE] applying flow block: %s", canonicalKeyString(banKey))
-									}
+									log.Printf("   -> [QUARANTINE] blocking %s", canonicalKeyString(banKey))
 									if err := objs.DropFlowsMap.Put(&banKey, &dummyValue); err != nil {
 										log.Printf("   -> [ERROR] Failed to push quarantine to kernel: %v", err)
 									} else {
