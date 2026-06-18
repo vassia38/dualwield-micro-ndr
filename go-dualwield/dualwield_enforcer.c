@@ -148,6 +148,45 @@ struct {
   __type(value, __u32);
 } drop_flows_map SEC(".maps");
 
+// LPM trie key for the IPv4 allowlist. addr holds the four address bytes in
+// network order; on this little-endian target that is exactly the raw value
+// read from ip->saddr/ip->daddr (same layout as the flow_key IPs). The kernel
+// LPM trie matches the most-significant `prefixlen` bits of addr, so the first
+// address octet must be the most significant byte, which it is on LE.
+struct lpm_v4_key {
+  __u32 prefixlen;
+  __u32 addr;
+};
+
+// Allowlist of trusted addresses/CIDRs that must never be scored or blocked
+// (router's own IPs, default gateway, DNS resolvers, loopback, plus any
+// user-supplied entries). It is consulted FIRST in the datapath: a match returns
+// TC_ACT_OK before any drop lookup or flow accounting, so trusted infrastructure
+// can never be quarantined - even if a bad rule reaches the banlist - and
+// management traffic never fills the 4096-entry flow table.
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(max_entries, 4096);
+  __type(key, struct lpm_v4_key);
+  __type(value, __u32);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} allowlist_v4 SEC(".maps");
+
+// Known-bad addresses/CIDRs from threat-intelligence feeds (Spamhaus DROP,
+// abuse.ch, Emerging Threats, FireHOL, CINS, ...). Checked AFTER the allowlist,
+// so a trusted address always wins over a feed false-positive; a match drops the
+// packet. This is the signature layer - reputation of known-bad IPs - that
+// complements the behavioural ML: deterministic, low-FP blocking that does not
+// depend on the drifting classifier. Sized larger than the allowlist because
+// consolidated feeds run to tens of thousands of entries.
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(max_entries, 65536);
+  __type(key, struct lpm_v4_key);
+  __type(value, __u32);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} blocklist_v4 SEC(".maps");
+
 // Helper: create a canonical flow_key from two IPs and ports.
 static __inline void make_canonical(__u32 ip1, __u32 ip2, __u16 p1, __u16 p2, __u8 proto, struct flow_key *out) {
   if ((ip1 < ip2) || (ip1 == ip2 && p1 <= p2)) {
@@ -194,6 +233,39 @@ int dualwield_enforcer(struct __sk_buff *skb) {
 
   __u32 src_ip = ip->saddr;
   __u32 dst_ip = ip->daddr;
+
+  // NetFlow IN_BYTES/OUT_BYTES count L3 bytes (IP header + payload) - the same
+  // semantics nProbe used when building NF-UQ-NIDS-v2. skb->len includes the
+  // 14-byte Ethernet header, which systematically inflated every byte feature
+  // (worst on small packets: ~25% on a 60-byte frame). ip->tot_len is the
+  // on-wire IP datagram length and matches the training feature exactly.
+  // Caveat: assumes flow offloading is disabled (as in the Chapter 6 testbed);
+  // GRO could coalesce segments so a single skb reports one tot_len.
+  __u32 l3_len = bpf_ntohs(ip->tot_len);
+
+  // --- Allowlist short-circuit ---
+  // If either endpoint is trusted, pass immediately: no block, no accounting.
+  // This runs before the quarantine lookups so the allowlist always overrides a
+  // ban, protecting the gateway/router from a misclassified self-block.
+  struct lpm_v4_key akey = {};
+  akey.prefixlen = 32;
+  akey.addr = src_ip;
+  if (bpf_map_lookup_elem(&allowlist_v4, &akey))
+    return TC_ACT_OK;
+  akey.addr = dst_ip;
+  if (bpf_map_lookup_elem(&allowlist_v4, &akey))
+    return TC_ACT_OK;
+
+  // --- Threat-intel blocklist ---
+  // Known-bad source or destination: drop. The allowlist above already had
+  // priority, so a trusted address is never dropped here. Reuses akey (prefixlen
+  // is still 32 from the allowlist lookups).
+  akey.addr = src_ip;
+  if (bpf_map_lookup_elem(&blocklist_v4, &akey))
+    return TC_ACT_SHOT;
+  akey.addr = dst_ip;
+  if (bpf_map_lookup_elem(&blocklist_v4, &akey))
+    return TC_ACT_SHOT;
 
   // --- Flow tracking ---
   //
@@ -284,10 +356,10 @@ int dualwield_enforcer(struct __sk_buff *skb) {
 
     if (is_a_to_b) {
       __sync_fetch_and_add(&stats->pkts_a_to_b, 1);
-      __sync_fetch_and_add(&stats->bytes_a_to_b, skb->len);
+      __sync_fetch_and_add(&stats->bytes_a_to_b, l3_len);
     } else {
       __sync_fetch_and_add(&stats->pkts_b_to_a, 1);
-      __sync_fetch_and_add(&stats->bytes_b_to_a, skb->len);
+      __sync_fetch_and_add(&stats->bytes_b_to_a, l3_len);
     }
 
     // packets should almost always be steered to the same CPU core but even in
@@ -300,11 +372,11 @@ int dualwield_enforcer(struct __sk_buff *skb) {
     struct flow_stats new_stats = {};
     if (is_a_to_b) {
       new_stats.pkts_a_to_b = 1;
-      new_stats.bytes_a_to_b = skb->len;
+      new_stats.bytes_a_to_b = l3_len;
       new_stats.initiator = 0;
     } else {
       new_stats.pkts_b_to_a = 1;
-      new_stats.bytes_b_to_a = skb->len;
+      new_stats.bytes_b_to_a = l3_len;
       new_stats.initiator = 1;
     }
     new_stats.start_time_ns = now;
