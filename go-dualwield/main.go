@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -13,8 +14,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"go-dualwield/predictconfidence"
 
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
@@ -310,6 +309,69 @@ func persistBanlistEntry(k flowKey) {
 	if err := appendUniqueLine(banlistPath, line); err != nil {
 		log.Printf("Failed to persist banlist entry: %v", err)
 	}
+}
+
+// predictAndConfidence returns the argmax class and its confidence for a score
+// vector, handling already-normalized probabilities, vote counts, and raw scores.
+func predictAndConfidence(scores []float64) (int, float64) {
+	n := len(scores)
+	if n == 0 {
+		return 0, 0.0
+	}
+
+	var sum float64
+	for _, v := range scores {
+		sum += v
+	}
+	const eps = 1e-6
+
+	var probs []float64
+	if math.Abs(sum-1.0) < eps && sum > 0 {
+		probs = make([]float64, n)
+		copy(probs, scores)
+	} else {
+		allNonNeg := true
+		for _, v := range scores {
+			if v < 0 {
+				allNonNeg = false
+				break
+			}
+		}
+		if allNonNeg && sum > 0 {
+			probs = make([]float64, n)
+			for i, v := range scores {
+				probs[i] = v / sum
+			}
+		} else {
+			max := scores[0]
+			for _, v := range scores {
+				if v > max {
+					max = v
+				}
+			}
+			exps := make([]float64, n)
+			var expSum float64
+			for i, v := range scores {
+				e := math.Exp(v - max)
+				exps[i] = e
+				expSum += e
+			}
+			probs = make([]float64, n)
+			for i := range exps {
+				probs[i] = exps[i] / expSum
+			}
+		}
+	}
+
+	bestIdx := 0
+	bestVal := probs[0]
+	for i, p := range probs {
+		if p > bestVal {
+			bestVal = p
+			bestIdx = i
+		}
+	}
+	return bestIdx, bestVal
 }
 
 // read a text file and syncs it with the eBPF drop map.
@@ -1097,7 +1159,7 @@ func main() {
 						mlT0 := time.Now()
 						binaryScores := binaryScore(features)
 						mlNanos += time.Since(mlT0).Nanoseconds()
-						binaryPrediction, binaryConfidence := predictconfidence.PredictAndConfidence(binaryScores)
+						binaryPrediction, binaryConfidence := predictAndConfidence(binaryScores)
 
 						if binaryPrediction == 0 {
 							// STAGE 1 -> Benign: No further analysis needed
@@ -1116,7 +1178,7 @@ func main() {
 							mlT1 := time.Now()
 							multiclassScores := multiclassScore(features)
 							mlNanos += time.Since(mlT1).Nanoseconds()
-							multiclassPrediction, multiclassConfidence := predictconfidence.PredictAndConfidence(multiclassScores)
+							multiclassPrediction, multiclassConfidence := predictAndConfidence(multiclassScores)
 
 							attackName, known := attackMap[multiclassPrediction]
 							if !known {
