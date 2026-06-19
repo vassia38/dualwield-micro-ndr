@@ -1026,12 +1026,22 @@ func main() {
 	}
 	defer objs.Close()
 
-	// 2. Attach the sensor to each configured interface (ingress + egress).
+	// 2. Resolve interfaces and load the trusted/internal sets BEFORE attaching,
+	// so the datapath never runs with an empty allowlist. Otherwise a flow already
+	// in progress when the agent starts (e.g. the management SSH session) is
+	// accounted and scored once in the gap between attach and allowlist load.
 	ifaces := resolveIfaces(*ifacesFlag)
 	if len(ifaces) == 0 {
 		log.Fatalf("No interfaces to attach to (set -ifaces or DW_IFACES)")
 	}
 
+	// Trusted infrastructure (router, gateway, DNS, loopback, group traffic, plus
+	// user entries) is never blocked or scored. Loaded regardless of DETECT_ONLY.
+	loadAllowlist(objs.AllowlistV4, ifaces)
+	// Internal-network set for role-aware ban scope (1.3).
+	loadLanNets(ifaces)
+
+	// 3. Attach the sensor to each configured interface (ingress + egress).
 	var cleanups []func()
 	for _, iface := range ifaces {
 		cleanup, err := attachInterface(iface, objs.DualwieldEnforcer.FD())
@@ -1053,15 +1063,6 @@ func main() {
 		}
 		log.Println("Cleanup complete. Sensor detached and maps flushed.")
 	}()
-
-	// Load the allowlist before any traffic is scored. Trusted infrastructure
-	// (router, gateway, DNS, loopback, plus user entries) is never blocked or
-	// scored. Loaded regardless of DETECT_ONLY: the datapath check is always
-	// active and we never want to alert on the gateway either.
-	loadAllowlist(objs.AllowlistV4, ifaces)
-
-	// Internal-network set for role-aware ban scope (1.3).
-	loadLanNets(ifaces)
 
 	// 3. Start Banlist Monitor and setup polling for ML features
 
