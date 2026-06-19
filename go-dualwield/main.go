@@ -832,6 +832,13 @@ var lanNets []*net.IPNet
 // loadLanNets builds lanNets from the -lan-cidr flag plus the subnets of the
 // attached interfaces. Called once at startup before the polling goroutine reads
 // lanNets.
+//
+// CAVEAT: the auto-derivation trusts the subnet of every attached interface. With
+// the default (-ifaces br-lan) that is exactly the LAN. If you also attach the WAN
+// interface, its subnet becomes "internal" too, so an external host on that subnet
+// would be treated as a compromised insider and could be quarantined host-wide.
+// When attaching to a WAN-facing interface, set -lan-cidr explicitly to the real
+// internal range(s) instead of relying on auto-derivation.
 func loadLanNets(ifaces []string) {
 	var nets []*net.IPNet
 	for _, p := range strings.Split(*lanCIDRFlag, ",") {
@@ -887,7 +894,8 @@ var ifacesFlag = flag.String("ifaces", "br-lan",
 
 // lanCIDRFlag (1.3) lists internal/LAN CIDRs. Empty = auto-derive from the
 // attached interfaces' subnets. Internal hosts that turn malicious are
-// quarantined host-wide; external attackers get scoped bans only.
+// quarantined host-wide; external attackers get scoped bans only. Set this
+// explicitly when attaching to a WAN interface (see loadLanNets caveat).
 var lanCIDRFlag = flag.String("lan-cidr", "",
 	"comma-separated internal/LAN CIDRs (default: auto from attached interfaces)")
 
@@ -1118,16 +1126,23 @@ func main() {
 						var clientPort, serverPort uint16
 						var outPkts, outBytes, inPkts, inBytes uint64
 
-						if stats.Initiator == 1 {
+						// The client is the flow initiator. The kernel records
+						// initiator=0 when endpoint a sent the first packet, =1 when b
+						// did, so client = a iff initiator==0. (Earlier this branch was
+						// inverted, which swapped L4_SRC_PORT/L4_DST_PORT versus the
+						// NF-UQ-NIDS convention and made the role-aware ban act on the
+						// responder instead of the initiator.) IN_BYTES is the
+						// client->server direction, OUT_BYTES the reverse.
+						if stats.Initiator == 0 {
 							clientIP, serverIP = key.IpA, key.IpB
 							clientPort, serverPort = key.PortA, key.PortB
-							outPkts, outBytes = stats.PktsAToB, stats.BytesAToB
-							inPkts, inBytes = stats.PktsBToA, stats.BytesBToA
+							inPkts, inBytes = stats.PktsAToB, stats.BytesAToB
+							outPkts, outBytes = stats.PktsBToA, stats.BytesBToA
 						} else {
 							clientIP, serverIP = key.IpB, key.IpA
 							clientPort, serverPort = key.PortB, key.PortA
-							outPkts, outBytes = stats.PktsBToA, stats.BytesBToA
-							inPkts, inBytes = stats.PktsAToB, stats.BytesAToB
+							inPkts, inBytes = stats.PktsBToA, stats.BytesBToA
+							outPkts, outBytes = stats.PktsAToB, stats.BytesAToB
 						}
 
 						durationMs := (stats.LastTimeNs - stats.StartTimeNs) / 1000000
@@ -1206,9 +1221,10 @@ func main() {
 								// - Internal (LAN) actor = a compromised host: quarantine it
 								//   host-wide (IP wildcard, attacker -> any). Cutting one LAN device
 								//   is acceptable and desirable.
-								// - External actor: scope the ban to this victim only - DDoS/DoS
-								//   gets a port-wildcard on the attacker<->victim pair, everything
-								//   else an exact 5-tuple. We NEVER place an IP wildcard on an
+								// - External actor: scope the ban to this victim only - DDoS
+								//   (class 1) gets a port-wildcard on the attacker<->victim pair,
+								//   everything else (incl. DoS class 4) an exact 5-tuple. We
+								//   NEVER place an IP wildcard on an
 								//   outside address (it may be shared infrastructure), and the
 								//   allowlist already protects the gateway/upstream. This is the
 								//   inversion that stops a WAN-side misclassification from cutting
