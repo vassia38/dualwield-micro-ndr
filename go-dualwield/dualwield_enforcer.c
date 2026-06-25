@@ -93,10 +93,10 @@ struct lpm_v4_key {
 
 // Allowlist of trusted addresses/CIDRs that must never be scored or blocked
 // (router's own IPs, default gateway, DNS resolvers, loopback, plus any
-// user-supplied entries). It is consulted FIRST in the datapath: a match returns
-// TC_ACT_OK before any drop lookup or flow accounting, so trusted infrastructure
-// can never be quarantined - even if a bad rule reaches the banlist - and
-// management traffic never fills the 4096-entry flow table.
+// user-supplied entries). It is consulted FIRST in the datapath: a match
+// returns TC_ACT_OK before any drop lookup or flow accounting, so trusted
+// infrastructure can never be quarantined - even if a bad rule reaches the
+// banlist - and management traffic never fills the 4096-entry flow table.
 struct {
   __uint(type, BPF_MAP_TYPE_LPM_TRIE);
   __uint(max_entries, 4096);
@@ -107,8 +107,8 @@ struct {
 
 // Known-bad addresses/CIDRs from threat-intelligence feeds (Spamhaus DROP,
 // abuse.ch, Emerging Threats, FireHOL, CINS, ...). Checked AFTER the allowlist,
-// so a trusted address always wins over a feed false-positive; a match drops the
-// packet. This is the signature layer - reputation of known-bad IPs - that
+// so a trusted address always wins over a feed false-positive; a match drops
+// the packet. This is the signature layer - reputation of known-bad IPs - that
 // complements the behavioural ML: deterministic, low-FP blocking that does not
 // depend on the drifting classifier. Sized larger than the allowlist because
 // consolidated feeds run to tens of thousands of entries.
@@ -120,9 +120,9 @@ struct {
   __uint(map_flags, BPF_F_NO_PREALLOC);
 } blocklist_v4 SEC(".maps");
 
-// Drop counters for observability: index 0 = reputation blocklist, 1 = ML/banlist
-// quarantine. PERCPU so the increment is lock-free on the datapath; userspace sums
-// across CPUs. Lets Chapter 6 quantify how much traffic each layer actually dropped.
+// Drop counters for observability: index 0 = reputation blocklist, 1 =
+// ML/banlist quarantine. PERCPU so the increment is lock-free on the datapath;
+// userspace sums across CPUs.
 #define DROP_STAT_REPUTATION 0
 #define DROP_STAT_QUARANTINE 1
 struct {
@@ -138,12 +138,14 @@ static __inline void count_drop(__u32 idx) {
     (*c)++;
 }
 
-// Helper: create a canonical flow_key from two IPs and ports. This is the SINGLE
-// source of the ordering rule; the packet path calls it instead of inlining its
-// own copy, and the Go loader mirrors it in makeCanonicalKey. Comparison is on the
-// raw network-order values (ports as read from the header / produced by htons).
-// Returns true if (ip1,p1) became endpoint a, so the caller can tell direction.
-static __inline bool make_canonical(__u32 ip1, __u32 ip2, __u16 p1, __u16 p2, __u8 proto, struct flow_key *out) {
+// Helper: create a canonical flow_key from two IPs and ports. This is the
+// SINGLE source of the ordering rule; the packet path calls it instead of
+// inlining its own copy, and the Go loader mirrors it in makeCanonicalKey.
+// Comparison is on the raw network-order values (ports as read from the header
+// / produced by htons). Returns true if (ip1,p1) became endpoint a, so the
+// caller can tell direction.
+static __inline bool make_canonical(__u32 ip1, __u32 ip2, __u16 p1, __u16 p2,
+                                    __u8 proto, struct flow_key *out) {
   bool first_is_a = (ip1 < ip2) || (ip1 == ip2 && p1 <= p2);
   if (first_is_a) {
     out->ip_a = ip1;
@@ -181,9 +183,9 @@ int dualwield_enforcer(struct __sk_buff *skb) {
   __u16 h_proto = eth->h_proto;
   void *l3 = (void *)(eth + 1);
 
-  // Unwrap a single 802.1Q / 802.1ad VLAN tag if present, so tagged IPv4 traffic
-  // is still inspected and enforceable rather than passing through unseen.
-  // (QinQ double-tagging is rare and left unhandled.)
+  // Unwrap a single 802.1Q / 802.1ad VLAN tag if present, so tagged IPv4
+  // traffic is still inspected and enforceable rather than passing through
+  // unseen. (QinQ double-tagging is rare and left unhandled.)
   if (h_proto == bpf_htons(ETH_P_8021Q) || h_proto == bpf_htons(ETH_P_8021AD)) {
     struct vlan_hdr {
       __be16 h_vlan_TCI;
@@ -196,13 +198,9 @@ int dualwield_enforcer(struct __sk_buff *skb) {
     l3 = (void *)(vhdr + 1);
   }
 
-  // Allow non-IPv4 traffic to pass through. IPv6 is intentionally out of scope:
-  // it is passed unfiltered (a documented limitation - the flow model, maps and
-  // ML features are all IPv4). On a dual-stack link this is a blind spot.
+  // Allow non-IPv4 traffic to pass through. \
   if (h_proto != bpf_htons(ETH_P_IP))
-    return TC_ACT_OK;
-
-  // --- Parse IPv4 ---
+  return TC_ACT_OK;
 
   struct iphdr *ip = l3;
   // Bounds checking for the IP header
@@ -217,7 +215,7 @@ int dualwield_enforcer(struct __sk_buff *skb) {
   // 14-byte Ethernet header, which systematically inflated every byte feature
   // (worst on small packets: ~25% on a 60-byte frame). ip->tot_len is the
   // on-wire IP datagram length and matches the training feature exactly.
-  // Caveat: assumes flow offloading is disabled (as in the Chapter 6 testbed);
+  // Caveat: assumes flow offloading is disabled;
   // GRO could coalesce segments so a single skb reports one tot_len.
   __u32 l3_len = bpf_ntohs(ip->tot_len);
 
@@ -236,8 +234,8 @@ int dualwield_enforcer(struct __sk_buff *skb) {
 
   // --- Threat-intel blocklist ---
   // Known-bad source or destination: drop. The allowlist above already had
-  // priority, so a trusted address is never dropped here. Reuses akey (prefixlen
-  // is still 32 from the allowlist lookups).
+  // priority, so a trusted address is never dropped here. Reuses akey
+  // (prefixlen is still 32 from the allowlist lookups).
   akey.addr = src_ip;
   if (bpf_map_lookup_elem(&blocklist_v4, &akey)) {
     count_drop(DROP_STAT_REPUTATION);
@@ -261,8 +259,8 @@ int dualwield_enforcer(struct __sk_buff *skb) {
     return TC_ACT_OK;
 
   // Non-initial IP fragments carry no L4 header: reading the L4 offset would
-  // interpret payload bytes as ports. Only the first fragment (offset 0) has the
-  // ports; later fragments are tracked by IP+protocol with ports left at 0.
+  // interpret payload bytes as ports. Only the first fragment (offset 0) has
+  // the ports; later fragments are tracked by IP+protocol with ports left at 0.
   bool has_l4 = (bpf_ntohs(ip->frag_off) & 0x1FFF) == 0;
 
   __u16 src_port = 0;
@@ -289,20 +287,23 @@ int dualwield_enforcer(struct __sk_buff *skb) {
     }
   }
 
-  // Build the canonical key via the shared helper (the Go loader mirrors the same
-  // ordering), and learn the direction for the per-direction counters below.
+  // Build the canonical key via the shared helper (the Go loader mirrors the
+  // same ordering), and learn the direction for the per-direction counters
+  // below.
   struct flow_key fkey = {};
-  bool is_a_to_b = make_canonical(src_ip, dst_ip, src_port, dst_port, ip->protocol, &fkey);
+  bool is_a_to_b =
+      make_canonical(src_ip, dst_ip, src_port, dst_port, ip->protocol, &fkey);
 
   // --- Quarantine check ---
 
-  // The drop map supports three ban granularities, each a key built with the same
-  // canonicalization as on insert. None of these are dead: patterns (1)/(2) are
-  // produced by the ML quarantine path (exact 5-tuple, and port-wildcard IP-pair
-  // for DDoS), and pattern (3) is produced by IP-wildcard banlist entries such as
-  // "6,1.2.3.4,*,0.0.0.0,*" and by the (planned) role-aware quarantine of a
-  // compromised host. Cost note for Chapter 6.4: this is up to four drop-map
-  // lookups per packet on top of the two allowlist and two blocklist lookups.
+  // The drop map supports three ban granularities, each a key built with the
+  // same canonicalization as on insert. None of these are dead: patterns
+  // (1)/(2) are produced by the ML quarantine path (exact 5-tuple, and
+  // port-wildcard IP-pair for DDoS), and pattern (3) is produced by IP-wildcard
+  // banlist entries such as "6,1.2.3.4,*,0.0.0.0,*" and by the (planned)
+  // role-aware quarantine of a compromised host. Cost note for Chapter 6.4:
+  // this is up to four drop-map lookups per packet on top of the two allowlist
+  // and two blocklist lookups.
   struct flow_key try = {};
   __u32 *is_blocked = NULL;
 
@@ -321,8 +322,8 @@ int dualwield_enforcer(struct __sk_buff *skb) {
     return TC_ACT_SHOT;
   }
 
-  // 3) IP wildcard: one address to/from anywhere (the other ip and both ports 0).
-  // Try both src and dst as the banned address.
+  // 3) IP wildcard: one address to/from anywhere (the other ip and both ports
+  // 0). Try both src and dst as the banned address.
   make_canonical(src_ip, 0, 0, 0, fkey.protocol, &try);
   is_blocked = bpf_map_lookup_elem(&drop_flows_map, &try);
   if (is_blocked) {

@@ -136,7 +136,7 @@ var allowlistNets []*net.IPNet
 var (
 	alertedFlows     = make(map[flowKey]struct{})
 	socReviewedFlows = make(map[flowKey]struct{})
-	// lastScoredPkts (2.3) records the total packet count at the last time a flow
+	// lastScoredPkts records the total packet count at the last time a flow
 	// was scored, so a flow with no new packets can be skipped. Cleared on eviction.
 	lastScoredPkts = make(map[flowKey]uint64)
 )
@@ -567,7 +567,7 @@ func sumPerCPU(m *ebpf.Map, key uint32) (uint64, error) {
 
 // monitorDropStats periodically logs the cumulative packet counts dropped by the
 // reputation blocklist and by the ML/banlist quarantine, but only when they
-// change, so Chapter 6 can quantify each layer's contribution without log spam.
+// change, so we can quantify each layer's contribution without log spam.
 func monitorDropStats(statsMap *ebpf.Map, interval time.Duration) {
 	if statsMap == nil {
 		return
@@ -900,9 +900,9 @@ var lanCIDRFlag = flag.String("lan-cidr", "",
 	"comma-separated internal/LAN CIDRs (default: auto from attached interfaces)")
 
 // minConfidence (2.1) is the Stage-2 confidence floor for ENFORCEMENT. Below it
-// a malicious verdict is still alerted but not blocked. minPackets (2.2) is the
+// a malicious verdict is still alerted but not blocked. minPackets is the
 // maturity gate: a flow must have at least this many packets before it may be
-// blocked, because the features of a very young flow are unreliable (Chapter 6.2).
+// blocked, because the features of a very young flow are unreliable.
 var minConfidence = flag.Float64("min-confidence", 0.80,
 	"minimum Stage-2 confidence required to enforce a block (below this: alert only)")
 
@@ -1006,7 +1006,7 @@ func attachInterface(ifaceName string, progFD int) (func(), error) {
 
 func main() {
 	// Microsecond-resolution timestamps on every log line, used to measure
-	// the attack-to-block latency in Chapter 6.5 (default log resolution is 1s).
+	// the attack-to-block latency (default log resolution is 1s).
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	flag.Parse()
@@ -1068,11 +1068,11 @@ func main() {
 
 	if !detectOnly {
 		go monitorBanlist(banlistPath, objs.DropFlowsMap, 5*time.Second)
-		// Threat-intel reputation feed (3.1). Skipped in DETECT_ONLY so the
+		// Threat-intel reputation feed. Skipped in DETECT_ONLY so the
 		// overhead measurement never drops traffic.
 		go monitorBlocklist(threatIntelPath, objs.BlocklistV4, *blocklistRefresh)
 	}
-	// Drop-counter observability (3.1 follow-up): runs regardless of mode (it only
+	// Drop-counter observability: runs regardless of mode (it only
 	// reads counters; in DETECT_ONLY nothing is dropped so they stay at 0).
 	go monitorDropStats(objs.DropStats, 30*time.Second)
 	ticker := time.NewTicker(3 * time.Second)
@@ -1099,8 +1099,8 @@ func main() {
 
 				iterator := objs.ActiveFlows.Iterate()
 				flowsFound := false
-				activeCount := 0         // flows present in the table at this poll (Chapter 6.4 saturation)
-				batchStart := time.Now() // poll-batch wall time (Chapter 6.5)
+				activeCount := 0         // flows present in the table at this poll
+				batchStart := time.Now() // poll-batch wall time
 				var mlNanos int64        // cumulative pure ML inference time this batch
 
 				for iterator.Next(&key, &stats) {
@@ -1113,7 +1113,7 @@ func main() {
 					// Eviction is evaluated on every poll; scoring is not.
 					shouldEvict := false
 
-					// 2.3: skip flows that received no new packets since the last
+					// skip flows that received no new packets since the last
 					// poll - re-running the model on an unchanged flow only re-derives
 					// a verdict we already acted on. A flow still taking packets keeps
 					// being re-scored (its count changes) until it matures.
@@ -1129,10 +1129,7 @@ func main() {
 
 						// The client is the flow initiator. The kernel records
 						// initiator=0 when endpoint a sent the first packet, =1 when b
-						// did, so client = a iff initiator==0. (Earlier this branch was
-						// inverted, which swapped L4_SRC_PORT/L4_DST_PORT versus the
-						// NF-UQ-NIDS convention and made the role-aware ban act on the
-						// responder instead of the initiator.) IN_BYTES is the
+						// did, so client = a iff initiator==0. IN_BYTES is the
 						// client->server direction, OUT_BYTES the reverse.
 						if stats.Initiator == 0 {
 							clientIP, serverIP = key.IpA, key.IpB
@@ -1218,7 +1215,7 @@ func main() {
 
 								dummyValue := uint32(1)
 
-								// 1.3 role-aware ban scope. The initiator (clientIP) is the actor.
+								// role-aware ban scope. The initiator (clientIP) is the actor.
 								// - Internal (LAN) actor = a compromised host: quarantine it
 								//   host-wide (IP wildcard, attacker -> any). Cutting one LAN device
 								//   is acceptable and desirable.
@@ -1230,7 +1227,7 @@ func main() {
 								//   allowlist already protects the gateway/upstream. This is the
 								//   inversion that stops a WAN-side misclassification from cutting
 								//   the uplink.
-								// 1.4: a per-IP ban only addresses single-source DoS / scanning /
+								// a per-IP ban only addresses single-source DoS / scanning /
 								// a compromised host - NOT a distributed or spoofed-source flood
 								// (those sources never repeat, and spoofed ones never reach here).
 								var banKey flowKey
@@ -1243,9 +1240,9 @@ func main() {
 									banKey = key // exact 5-tuple
 								}
 
-								// 2.1 + 2.2: the maturity gate and confidence floor gate
+								// the maturity gate and confidence floor gate
 								// ENFORCEMENT only. Below either bar we still alert (detection
-								// is preserved) but do not block, because Chapter 6.2 shows the
+								// is preserved) but do not block, because it is known that the
 								// false positives came from immature/low-confidence verdicts.
 								mature := totalPkts >= uint64(*minPackets)
 								confident := multiclassConfidence >= *minConfidence
@@ -1275,8 +1272,11 @@ func main() {
 									}
 								}
 							}
+									}
+								}
+							}
 						}
-					} // end if changed (2.3 skip re-scoring unchanged flows)
+					}
 
 					// ========== FLOW EVICTION LOGIC ==========
 					// Always check if flow should be evicted (TCP closed or idle timeout)
@@ -1303,14 +1303,14 @@ func main() {
 					log.Printf("Error iterating ActiveFlows map: %v", err)
 				}
 
-				// Flow-table occupancy snapshot (Chapter 6.4): how close the
+				// Flow-table occupancy snapshot: how close the
 				// 4096-entry active_flows map is to saturation under load.
 				if flowsFound {
 					maxEntries := objs.ActiveFlows.MaxEntries()
 					log.Printf("[FLOW-TABLE] active=%d/%d (%.1f%% full)",
 						activeCount, maxEntries,
 						100*float64(activeCount)/float64(maxEntries))
-					log.Printf("[TIMING] batch=%v ml_total=%.2fms flows=%d (Chapter 6.5)",
+					log.Printf("[TIMING] batch=%v ml_total=%.2fms flows=%d",
 						time.Since(batchStart), float64(mlNanos)/1e6, activeCount)
 				}
 
